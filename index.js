@@ -599,8 +599,13 @@ client.on('interactionCreate', async interaction => {
       }
       case 'vc_transfer':
       case 'transfer': {
-        const otherMembers = Array.from(targetVc.members.values()).filter(m => m.id !== interaction.user.id);
-        const options = otherMembers.map(m => ({ label: m.displayName.slice(0, 100), value: m.id }));
+        const isServerOwner = interaction.user.id === interaction.guild.ownerId;
+        const currentOwnerId = vcData?.ownerId;
+        const eligibleMembers = Array.from(targetVc.members.values()).filter(m => {
+          if (isServerOwner) return m.id !== currentOwnerId;
+          return m.id !== interaction.user.id;
+        });
+        const options = eligibleMembers.map(m => ({ label: m.displayName.slice(0, 100), value: m.id }));
         if (options.length === 0) options.push({ label: 'No eligible members', value: 'none', default: true });
         const select = new StringSelectMenuBuilder()
           .setCustomId('vc_select_transfer')
@@ -648,6 +653,7 @@ client.on('interactionCreate', async interaction => {
       return interaction.followUp({ content: `🚫 ${member.displayName} has been banned from this channel.`, ephemeral: true });
     }
     if (action === 'transfer') {
+      const vcData = activeVcs.get(targetVc.id);
       const oldOwnerId = vcData?.ownerId || interaction.user.id;
       await targetVc.permissionOverwrites.delete(oldOwnerId).catch(() => {});
       await targetVc.permissionOverwrites.edit(member.id, { Connect: true, ManageChannels: true });

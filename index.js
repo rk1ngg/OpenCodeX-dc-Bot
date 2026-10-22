@@ -305,8 +305,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         .addFields({ name: 'Voice Channel ID', value: leftChannel.id })
         .addFields({ name: 'Participants', value: participants })
         .addFields({ name: 'Session End', value: time(new Date(), 'F') })
-        .addFields({ name: 'Session Duration', value: `${duration} mins` })
-        .setFooter({ text: 'rkingg.com' });
+        .addFields({ name: 'Session Duration', value: `${duration} mins` });
 
       if (data?.creatorId) {
         let ownerLine = `<@${data.creatorId}>`;

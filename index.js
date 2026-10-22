@@ -324,6 +324,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 // Slash command & interaction handling (single listener)
 // -------------------------------------------------
 client.on('interactionCreate', async interaction => {
+  try {
   if (!interaction.inGuild()) return;
 
   // Helper to resolve the user's target Voice Channel (works even if command is used in another chat or if channel is uncached)
@@ -655,6 +656,9 @@ client.on('interactionCreate', async interaction => {
       await targetVc.send({ embeds: [createControlEmbed(member.id, member.displayName)], components: createControlRows() }).catch(() => {});
       return interaction.followUp({ content: `👑 Ownership transferred to ${member.displayName}.`, ephemeral: true });
     }
+  }
+  } catch (err) {
+    logger.error(`Interaction error: ${err}`);
   }
 });
 

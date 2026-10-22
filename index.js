@@ -46,7 +46,9 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.GuildMembers // needed for permission edits & member fetches
+    GatewayIntentBits.GuildMembers, // needed for permission edits & member fetches
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
   ]
 });
 
@@ -110,6 +112,25 @@ const commands = [
   {
     name: 'movechannel',
     description: 'Move a text channel right below another channel (owner only)'
+  },
+  {
+    name: 'say',
+    description: 'Make the bot send a message to a text channel (owner only)',
+    options: [
+      {
+        name: 'message',
+        type: 3, // STRING
+        description: 'The message to send',
+        required: true
+      },
+      {
+        name: 'channel',
+        type: 7, // CHANNEL
+        channel_types: [ChannelType.GuildText, ChannelType.GuildAnnouncement],
+        description: 'Optional target channel (defaults to /channelmsg channel)',
+        required: false
+      }
+    ]
   }
 ];
 
@@ -508,6 +529,30 @@ client.on('interactionCreate', async interaction => {
       return interaction.reply({ embeds: [embed], components: [row1, row2], ephemeral: true });
     }
 
+    // Owner‑only /say command
+    if (interaction.commandName === 'say') {
+      if (interaction.user.id !== interaction.guild.ownerId) {
+        return interaction.reply({ content: '❌ Only the server owner can run `/say`.', ephemeral: true });
+      }
+      const msgText = interaction.options.getString('message');
+      let targetChannel = interaction.options.getChannel('channel');
+      if (!targetChannel) {
+        const cfg = await getConfig(interaction.guild.id);
+        if (cfg.consoleChannelId) {
+          targetChannel = interaction.guild.channels.cache.get(cfg.consoleChannelId) ||
+            await interaction.guild.channels.fetch(cfg.consoleChannelId).catch(() => null);
+        }
+      }
+      if (!targetChannel || !targetChannel.isTextBased()) {
+        return interaction.reply({
+          content: '❌ No target channel specified and no default set. Provide a `channel` option or run `/channelmsg` first.',
+          ephemeral: true
+        });
+      }
+      await targetChannel.send({ content: msgText });
+      return interaction.reply({ content: `✅ Sent to <#${targetChannel.id}>!`, ephemeral: true });
+    }
+
     const targetVc = getTargetVc();
     if (!targetVc) {
       return interaction.reply({ content: '❌ Join your temporary voice channel first before using this command.', ephemeral: true });
@@ -820,6 +865,71 @@ client.on('channelDelete', async channel => {
 });
 
 // -------------------------------------------------
+// Message handler in #OpenCodeX:
+//   say <#channel or channel-name> <message>
+//   say <message>  (uses /channelmsg default channel)
+// -------------------------------------------------
+client.on('messageCreate', async message => {
+  try {
+    if (!message.inGuild() || message.author.bot) return;
+    if (message.author.id !== message.guild.ownerId) return;
+    if (message.channel.name.toLowerCase() !== OPEN_CODEX_CHANNEL_NAME) return;
+
+    const raw = message.content.trim();
+    if (!/^say\s+/i.test(raw)) return;
+
+    const restText = raw.replace(/^say\s+/i, '').trim();
+    if (!restText) return;
+
+    const firstSpaceIdx = restText.indexOf(' ');
+    const firstToken = firstSpaceIdx === -1 ? restText : restText.slice(0, firstSpaceIdx);
+    const afterFirstToken = firstSpaceIdx === -1 ? '' : restText.slice(firstSpaceIdx + 1).trim();
+
+    let targetChannel = null;
+    let finalMessage = restText;
+
+    // Check if first token is a <#channelId> mention, raw channel ID, or exact channel name
+    const mentionMatch = firstToken.match(/^<#(\d+)>$/) || firstToken.match(/^(\d{17,20})$/);
+    if (mentionMatch && afterFirstToken) {
+      const chId = mentionMatch[1];
+      targetChannel = message.guild.channels.cache.get(chId) ||
+        await message.guild.channels.fetch(chId).catch(() => null);
+      if (targetChannel) {
+        finalMessage = afterFirstToken;
+      }
+    } else if (afterFirstToken) {
+      const cleanName = firstToken.replace(/^#/, '').toLowerCase();
+      const byName = message.guild.channels.cache.find(
+        c => (c.type === ChannelType.GuildText || c.type === ChannelType.GuildAnnouncement) && c.name.toLowerCase() === cleanName
+      );
+      if (byName) {
+        targetChannel = byName;
+        finalMessage = afterFirstToken;
+      }
+    }
+
+    // Fallback to /channelmsg configured channel
+    if (!targetChannel) {
+      const cfg = await getConfig(message.guild.id);
+      if (cfg.consoleChannelId) {
+        targetChannel = message.guild.channels.cache.get(cfg.consoleChannelId) ||
+          await message.guild.channels.fetch(cfg.consoleChannelId).catch(() => null);
+      }
+    }
+
+    if (!targetChannel || !targetChannel.isTextBased()) {
+      await message.reply('❌ Walang target channel! Gamitin ang `say #channel <message>` o mag-set muna ng default gamit ang `/channelmsg`.');
+      return;
+    }
+
+    await targetChannel.send({ content: finalMessage });
+    await message.react('✅').catch(() => {});
+  } catch (err) {
+    logger.error(`OpenCodeX say error: ${err.message}`);
+  }
+});
+
+// -------------------------------------------------
 // Console Input Handler – send messages to /channelmsg target
 // -------------------------------------------------
 process.stdin.resume();
@@ -844,18 +954,39 @@ rl.on('line', async line => {
 
   let sentCount = 0;
   for (const guild of client.guilds.cache.values()) {
-    const cfg = await getConfig(guild.id);
-    if (cfg.consoleChannelId) {
-      const targetChannel = guild.channels.cache.get(cfg.consoleChannelId) ||
-        await guild.channels.fetch(cfg.consoleChannelId).catch(() => null);
-      if (targetChannel && targetChannel.isTextBased()) {
-        try {
-          await targetChannel.send({ content: messageContent });
-          logger.info(`💬 [Console -> #${targetChannel.name}]: ${messageContent}`);
-          sentCount++;
-        } catch (err) {
-          logger.error(`❌ Failed sending console message to #${targetChannel.name}: ${err.message}`);
-        }
+    let targetChannel = null;
+    let finalMsg = messageContent;
+
+    const spIdx = messageContent.indexOf(' ');
+    const tok1 = spIdx === -1 ? '' : messageContent.slice(0, spIdx);
+    const afterTok1 = spIdx === -1 ? '' : messageContent.slice(spIdx + 1).trim();
+
+    if (tok1 && afterTok1) {
+      const cleanName = tok1.replace(/^[#<]|>$/g, '').toLowerCase();
+      targetChannel = guild.channels.cache.get(cleanName) ||
+        guild.channels.cache.find(
+          c => (c.type === ChannelType.GuildText || c.type === ChannelType.GuildAnnouncement) && c.name.toLowerCase() === cleanName
+        );
+      if (targetChannel) {
+        finalMsg = afterTok1;
+      }
+    }
+
+    if (!targetChannel) {
+      const cfg = await getConfig(guild.id);
+      if (cfg.consoleChannelId) {
+        targetChannel = guild.channels.cache.get(cfg.consoleChannelId) ||
+          await guild.channels.fetch(cfg.consoleChannelId).catch(() => null);
+      }
+    }
+
+    if (targetChannel && targetChannel.isTextBased()) {
+      try {
+        await targetChannel.send({ content: finalMsg });
+        logger.info(`💬 [Console -> #${targetChannel.name}]: ${finalMsg}`);
+        sentCount++;
+      } catch (err) {
+        logger.error(`❌ Failed sending console message to #${targetChannel.name}: ${err.message}`);
       }
     }
   }

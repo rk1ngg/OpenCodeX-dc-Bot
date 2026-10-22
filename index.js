@@ -432,7 +432,9 @@ client.on('interactionCreate', async interaction => {
       case 'lock': {
         const everyoneOverwrite = interaction.channel.permissionOverwrites.cache.get(interaction.guildId);
         const currentlyLocked = everyoneOverwrite?.deny.has(PermissionFlagsBits.Connect);
-        await interaction.channel.permissionOverwrites.edit(interaction.guildId, { deny: currentlyLocked ? [] : [PermissionFlagsBits.Connect] });
+        await interaction.channel.permissionOverwrites.edit(interaction.guildId, {
+          Connect: currentlyLocked ? null : false
+        });
         return interaction.reply({ content: currentlyLocked ? '🔓 VC unlocked.' : '🔒 VC is now private.', ephemeral: true });
       }
       case 'limit': {
@@ -503,7 +505,9 @@ client.on('interactionCreate', async interaction => {
       case 'lock': {
         const everyoneOverwrite = interaction.channel.permissionOverwrites.cache.get(interaction.guildId);
         const currentlyLocked = everyoneOverwrite?.deny.has(PermissionFlagsBits.Connect);
-        await interaction.channel.permissionOverwrites.edit(interaction.guildId, { deny: currentlyLocked ? [] : [PermissionFlagsBits.Connect] });
+        await interaction.channel.permissionOverwrites.edit(interaction.guildId, {
+          Connect: currentlyLocked ? null : false
+        });
         return interaction.reply({ content: currentlyLocked ? '🔓 VC unlocked.' : '🔒 VC is now private.', ephemeral: true });
       }
       case 'vc_limit':

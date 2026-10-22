@@ -326,14 +326,29 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 client.on('interactionCreate', async interaction => {
   if (!interaction.inGuild()) return;
 
+  // Helper to resolve the user's target Voice Channel (works even if command is used in another chat or if channel is uncached)
+  const getTargetVc = () => {
+    if (interaction.channel?.isVoiceBased?.()) return interaction.channel;
+    return interaction.member?.voice?.channel || null;
+  };
+
   // Modal submit for user‑limit (shared between slash & button)
   if (interaction.isModalSubmit() && interaction.customId === 'modal_limit') {
     const val = parseInt(interaction.fields.getTextInputValue('limit_input'), 10);
     if (isNaN(val) || val < 0 || val > 99) {
       return interaction.reply({ content: '❌ Number must be between 0 and 99.', ephemeral: true });
     }
-    await interaction.channel.setUserLimit(val);
-    return interaction.reply({ content: val === 0 ? '👥 Limit removed (unlimited).' : `👥 Limit set to ${val}.`, ephemeral: true });
+    const targetVc = getTargetVc();
+    if (!targetVc) {
+      return interaction.reply({ content: '❌ You must be inside your temporary voice channel to set a limit.', ephemeral: true });
+    }
+    try {
+      await targetVc.edit({ userLimit: val });
+      return interaction.reply({ content: val === 0 ? `👥 Limit removed (unlimited) for <#${targetVc.id}>.` : `👥 Limit set to **${val}** for <#${targetVc.id}>.`, ephemeral: true });
+    } catch (err) {
+      logger.error(`Failed to set user limit: ${err}`);
+      return interaction.reply({ content: `❌ Failed to set limit: ${err.message}`, ephemeral: true });
+    }
   }
 
   // Modal submit for /setup
@@ -422,20 +437,27 @@ client.on('interactionCreate', async interaction => {
       return interaction.showModal(modal);
     }
 
-    const vcData = activeVcs.get(interaction.channelId);
-    const isOwner = vcData ? interaction.user.id === vcData.ownerId : interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels);
+    const targetVc = getTargetVc();
+    if (!targetVc) {
+      return interaction.reply({ content: '❌ Join your temporary voice channel first before using this command.', ephemeral: true });
+    }
+
+    const vcData = activeVcs.get(targetVc.id);
+    const isOwner = vcData
+      ? interaction.user.id === vcData.ownerId
+      : targetVc.permissionsFor(interaction.member)?.has(PermissionFlagsBits.ManageChannels);
     if (!isOwner) {
-      return interaction.reply({ content: '❌ Only the channel owner can use this command.', ephemeral: true });
+      return interaction.reply({ content: '❌ Only the voice channel owner can use this command.', ephemeral: true });
     }
 
     switch (interaction.commandName) {
       case 'lock': {
-        const everyoneOverwrite = interaction.channel.permissionOverwrites.cache.get(interaction.guildId);
+        const everyoneOverwrite = targetVc.permissionOverwrites.cache.get(interaction.guildId);
         const currentlyLocked = everyoneOverwrite?.deny.has(PermissionFlagsBits.Connect);
-        await interaction.channel.permissionOverwrites.edit(interaction.guildId, {
+        await targetVc.permissionOverwrites.edit(interaction.guildId, {
           Connect: currentlyLocked ? null : false
         });
-        return interaction.reply({ content: currentlyLocked ? '🔓 VC unlocked.' : '🔒 VC is now private.', ephemeral: true });
+        return interaction.reply({ content: currentlyLocked ? `🔓 <#${targetVc.id}> unlocked.` : `🔒 <#${targetVc.id}> is now private.`, ephemeral: true });
       }
       case 'limit': {
         const modal = new ModalBuilder()
@@ -455,7 +477,7 @@ client.on('interactionCreate', async interaction => {
         return interaction.showModal(modal);
       }
       case 'invite': {
-        const invite = await interaction.channel.createInvite({ maxAge: 300, maxUses: 1, unique: true });
+        const invite = await targetVc.createInvite({ maxAge: 300, maxUses: 1, unique: true });
         const embed = new EmbedBuilder()
           .setTitle('🔗 Temporary VC Invite Created')
           .setDescription('Share this link; it expires in **5 minutes** or after **1 use**.')
@@ -474,20 +496,20 @@ client.on('interactionCreate', async interaction => {
       }
       case 'ban': {
         const userId = interaction.options.getUser('user').id;
-        await interaction.channel.permissionOverwrites.edit(userId, { Connect: false });
+        await targetVc.permissionOverwrites.edit(userId, { Connect: false });
         const member = await interaction.guild.members.fetch(userId).catch(() => null);
-        if (member) await member.voice.disconnect().catch(() => {});
-        return interaction.reply({ content: `🚫 <@${userId}> banned from this VC.`, ephemeral: true });
+        if (member && member.voice.channelId === targetVc.id) await member.voice.disconnect().catch(() => {});
+        return interaction.reply({ content: `🚫 <@${userId}> banned from <#${targetVc.id}>.`, ephemeral: true });
       }
       case 'transfer': {
         const newOwnerId = interaction.options.getUser('user').id;
         const oldOwnerId = vcData?.ownerId;
-        if (oldOwnerId) await interaction.channel.permissionOverwrites.delete(oldOwnerId).catch(() => {});
-        await interaction.channel.permissionOverwrites.edit(newOwnerId, { Connect: true, ManageChannels: true });
+        if (oldOwnerId) await targetVc.permissionOverwrites.delete(oldOwnerId).catch(() => {});
+        await targetVc.permissionOverwrites.edit(newOwnerId, { Connect: true, ManageChannels: true });
         const newOwner = await interaction.guild.members.fetch(newOwnerId);
-        await interaction.channel.setName(`${newOwner.displayName}'s VC`).catch(() => {});
+        await targetVc.setName(`${newOwner.displayName}'s VC`).catch(() => {});
         if (vcData) vcData.ownerId = newOwnerId;
-        await interaction.channel.send({ embeds: [createControlEmbed(newOwnerId, newOwner.displayName)], components: createControlRows() }).catch(() => {});
+        await targetVc.send({ embeds: [createControlEmbed(newOwnerId, newOwner.displayName)], components: createControlRows() }).catch(() => {});
         return interaction.reply({ content: `👑 Ownership transferred to <@${newOwnerId}>.`, ephemeral: true });
       }
     }
@@ -495,20 +517,26 @@ client.on('interactionCreate', async interaction => {
 
   // Button handling
   if (interaction.isButton()) {
-    const vcData = activeVcs.get(interaction.channelId);
-    const isOwner = vcData ? interaction.user.id === vcData.ownerId : interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels);
+    const targetVc = getTargetVc();
+    if (!targetVc) {
+      return interaction.reply({ content: '❌ Join the voice channel first to use these controls.', ephemeral: true });
+    }
+    const vcData = activeVcs.get(targetVc.id);
+    const isOwner = vcData
+      ? interaction.user.id === vcData.ownerId
+      : targetVc.permissionsFor(interaction.member)?.has(PermissionFlagsBits.ManageChannels);
     if (!isOwner) {
       return interaction.reply({ content: '❌ Only the channel owner can use these controls.', ephemeral: true });
     }
     switch (interaction.customId) {
       case 'vc_lock':
       case 'lock': {
-        const everyoneOverwrite = interaction.channel.permissionOverwrites.cache.get(interaction.guildId);
+        const everyoneOverwrite = targetVc.permissionOverwrites.cache.get(interaction.guildId);
         const currentlyLocked = everyoneOverwrite?.deny.has(PermissionFlagsBits.Connect);
-        await interaction.channel.permissionOverwrites.edit(interaction.guildId, {
+        await targetVc.permissionOverwrites.edit(interaction.guildId, {
           Connect: currentlyLocked ? null : false
         });
-        return interaction.reply({ content: currentlyLocked ? '🔓 VC unlocked.' : '🔒 VC is now private.', ephemeral: true });
+        return interaction.reply({ content: currentlyLocked ? `🔓 <#${targetVc.id}> unlocked.` : `🔒 <#${targetVc.id}> is now private.`, ephemeral: true });
       }
       case 'vc_limit':
       case 'limit': {
@@ -530,7 +558,7 @@ client.on('interactionCreate', async interaction => {
       }
       case 'vc_invite':
       case 'invite': {
-        const invite = await interaction.channel.createInvite({ maxAge: 300, maxUses: 1, unique: true });
+        const invite = await targetVc.createInvite({ maxAge: 300, maxUses: 1, unique: true });
         const embed = new EmbedBuilder()
           .setTitle('🔗 Temporary VC Invite Created')
           .setDescription('Share this link; it expires in **5 minutes** or after **1 use**.')
@@ -543,7 +571,7 @@ client.on('interactionCreate', async interaction => {
       }
       case 'vc_kick':
       case 'kick': {
-        const otherMembers = Array.from(interaction.channel.members.values()).filter(m => m.id !== interaction.user.id);
+        const otherMembers = Array.from(targetVc.members.values()).filter(m => m.id !== interaction.user.id);
         const options = otherMembers.map(m => ({ label: m.displayName.slice(0, 100), value: m.id }));
         if (options.length > 0) options.push({ label: 'Kick All', value: 'all' });
         if (options.length === 0) options.push({ label: 'No users to kick', value: 'none', default: true });
@@ -555,7 +583,7 @@ client.on('interactionCreate', async interaction => {
       }
       case 'vc_ban':
       case 'ban': {
-        const otherMembers = Array.from(interaction.channel.members.values()).filter(m => m.id !== interaction.user.id);
+        const otherMembers = Array.from(targetVc.members.values()).filter(m => m.id !== interaction.user.id);
         const options = otherMembers.map(m => ({ label: m.displayName.slice(0, 100), value: m.id }));
         if (options.length > 0) options.push({ label: 'Ban All', value: 'all' });
         if (options.length === 0) options.push({ label: 'No users to ban', value: 'none', default: true });
@@ -567,7 +595,7 @@ client.on('interactionCreate', async interaction => {
       }
       case 'vc_transfer':
       case 'transfer': {
-        const otherMembers = Array.from(interaction.channel.members.values()).filter(m => m.id !== interaction.user.id);
+        const otherMembers = Array.from(targetVc.members.values()).filter(m => m.id !== interaction.user.id);
         const options = otherMembers.map(m => ({ label: m.displayName.slice(0, 100), value: m.id }));
         if (options.length === 0) options.push({ label: 'No eligible members', value: 'none', default: true });
         const select = new StringSelectMenuBuilder()
@@ -581,6 +609,10 @@ client.on('interactionCreate', async interaction => {
 
   // Select‑menu handling for kick/ban/transfer
   if (interaction.isStringSelectMenu() && interaction.customId.startsWith('vc_select_')) {
+    const targetVc = getTargetVc();
+    if (!targetVc) {
+      return interaction.reply({ content: '❌ Voice channel not found.', ephemeral: true });
+    }
     const action = interaction.customId.replace('vc_select_', '');
     const choice = interaction.values[0];
     if (choice === 'none') {
@@ -588,12 +620,12 @@ client.on('interactionCreate', async interaction => {
     }
     await interaction.deferReply({ ephemeral: true });
     if (choice === 'all') {
-      for (const m of interaction.channel.members.values()) {
+      for (const m of targetVc.members.values()) {
         if (m.id !== interaction.user.id) {
           if (action === 'kick') {
             await m.voice.disconnect().catch(() => {});
           } else if (action === 'ban') {
-            await interaction.channel.permissionOverwrites.edit(m.id, { Connect: false });
+            await targetVc.permissionOverwrites.edit(m.id, { Connect: false });
             await m.voice.disconnect().catch(() => {});
           }
         }
@@ -607,18 +639,18 @@ client.on('interactionCreate', async interaction => {
       return interaction.followUp({ content: `👢 ${member.displayName} has been kicked.`, ephemeral: true });
     }
     if (action === 'ban') {
-      await interaction.channel.permissionOverwrites.edit(member.id, { Connect: false });
-      if (interaction.channel.members.has(member.id)) await member.voice.disconnect().catch(() => {});
+      await targetVc.permissionOverwrites.edit(member.id, { Connect: false });
+      if (targetVc.members.has(member.id)) await member.voice.disconnect().catch(() => {});
       return interaction.followUp({ content: `🚫 ${member.displayName} has been banned from this channel.`, ephemeral: true });
     }
     if (action === 'transfer') {
       const oldOwner = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
-      if (oldOwner) await interaction.channel.permissionOverwrites.delete(oldOwner.id).catch(() => {});
-      await interaction.channel.permissionOverwrites.edit(member.id, { Connect: true, ManageChannels: true });
-      await interaction.channel.setName(`${member.displayName}'s VC`).catch(() => {});
-      const vcData = activeVcs.get(interaction.channelId);
+      if (oldOwner) await targetVc.permissionOverwrites.delete(oldOwner.id).catch(() => {});
+      await targetVc.permissionOverwrites.edit(member.id, { Connect: true, ManageChannels: true });
+      await targetVc.setName(`${member.displayName}'s VC`).catch(() => {});
+      const vcData = activeVcs.get(targetVc.id);
       if (vcData) vcData.ownerId = member.id;
-      await interaction.channel.send({ embeds: [createControlEmbed(member.id, member.displayName)], components: createControlRows() }).catch(() => {});
+      await targetVc.send({ embeds: [createControlEmbed(member.id, member.displayName)], components: createControlRows() }).catch(() => {});
       return interaction.followUp({ content: `👑 Ownership transferred to ${member.displayName}.`, ephemeral: true });
     }
   }

@@ -333,17 +333,18 @@ client.on('interactionCreate', async interaction => {
   };
 
   // Modal submit for user‑limit (shared between slash & button)
-  if (interaction.isModalSubmit() && interaction.customId === 'modal_limit') {
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_limit')) {
     const val = parseInt(interaction.fields.getTextInputValue('limit_input'), 10);
     if (isNaN(val) || val < 0 || val > 99) {
       return interaction.reply({ content: '❌ Number must be between 0 and 99.', ephemeral: true });
     }
-    const targetVc = getTargetVc();
+    const explicitId = interaction.customId.split(':')[1];
+    const targetVc = (explicitId && interaction.guild.channels.cache.get(explicitId)) || getTargetVc();
     if (!targetVc) {
       return interaction.reply({ content: '❌ You must be inside your temporary voice channel to set a limit.', ephemeral: true });
     }
     try {
-      await targetVc.edit({ userLimit: val });
+      await targetVc.setUserLimit(val);
       return interaction.reply({ content: val === 0 ? `👥 Limit removed (unlimited) for <#${targetVc.id}>.` : `👥 Limit set to **${val}** for <#${targetVc.id}>.`, ephemeral: true });
     } catch (err) {
       logger.error(`Failed to set user limit: ${err}`);
@@ -462,7 +463,7 @@ client.on('interactionCreate', async interaction => {
       }
       case 'limit': {
         const modal = new ModalBuilder()
-          .setCustomId('modal_limit')
+          .setCustomId(`modal_limit:${targetVc.id}`)
           .setTitle('Set VC User Limit')
           .addComponents(
             new ActionRowBuilder().addComponents(
@@ -543,7 +544,7 @@ client.on('interactionCreate', async interaction => {
       case 'vc_limit':
       case 'limit': {
         const modal = new ModalBuilder()
-          .setCustomId('modal_limit')
+          .setCustomId(`modal_limit:${targetVc.id}`)
           .setTitle('Set VC User Limit')
           .addComponents(
             new ActionRowBuilder().addComponents(

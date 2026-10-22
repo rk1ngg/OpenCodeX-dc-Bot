@@ -443,11 +443,12 @@ client.on('interactionCreate', async interaction => {
     }
 
     const vcData = activeVcs.get(targetVc.id);
-    const isOwner = vcData
+    const isServerOwner = interaction.user.id === interaction.guild.ownerId;
+    const isOwner = isServerOwner || (vcData
       ? interaction.user.id === vcData.ownerId
-      : targetVc.permissionsFor(interaction.member)?.has(PermissionFlagsBits.ManageChannels);
+      : targetVc.permissionsFor(interaction.member)?.has(PermissionFlagsBits.ManageChannels));
     if (!isOwner) {
-      return interaction.reply({ content: '❌ Only the voice channel owner can use this command.', ephemeral: true });
+      return interaction.reply({ content: '❌ Only the voice channel owner or server owner can use this command.', ephemeral: true });
     }
 
     switch (interaction.commandName) {
@@ -522,11 +523,12 @@ client.on('interactionCreate', async interaction => {
       return interaction.reply({ content: '❌ Join the voice channel first to use these controls.', ephemeral: true });
     }
     const vcData = activeVcs.get(targetVc.id);
-    const isOwner = vcData
+    const isServerOwner = interaction.user.id === interaction.guild.ownerId;
+    const isOwner = isServerOwner || (vcData
       ? interaction.user.id === vcData.ownerId
-      : targetVc.permissionsFor(interaction.member)?.has(PermissionFlagsBits.ManageChannels);
+      : targetVc.permissionsFor(interaction.member)?.has(PermissionFlagsBits.ManageChannels));
     if (!isOwner) {
-      return interaction.reply({ content: '❌ Only the channel owner can use these controls.', ephemeral: true });
+      return interaction.reply({ content: '❌ Only the channel owner or server owner can use these controls.', ephemeral: true });
     }
     switch (interaction.customId) {
       case 'vc_lock':
@@ -644,11 +646,10 @@ client.on('interactionCreate', async interaction => {
       return interaction.followUp({ content: `🚫 ${member.displayName} has been banned from this channel.`, ephemeral: true });
     }
     if (action === 'transfer') {
-      const oldOwner = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
-      if (oldOwner) await targetVc.permissionOverwrites.delete(oldOwner.id).catch(() => {});
+      const oldOwnerId = vcData?.ownerId || interaction.user.id;
+      await targetVc.permissionOverwrites.delete(oldOwnerId).catch(() => {});
       await targetVc.permissionOverwrites.edit(member.id, { Connect: true, ManageChannels: true });
       await targetVc.setName(`${member.displayName}'s VC`).catch(() => {});
-      const vcData = activeVcs.get(targetVc.id);
       if (vcData) vcData.ownerId = member.id;
       await targetVc.send({ embeds: [createControlEmbed(member.id, member.displayName)], components: createControlRows() }).catch(() => {});
       return interaction.followUp({ content: `👑 Ownership transferred to ${member.displayName}.`, ephemeral: true });

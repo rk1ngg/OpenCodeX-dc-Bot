@@ -23,6 +23,7 @@ import {
   Routes,
   time
 } from 'discord.js';
+import readline from 'readline';
 import logger from './src/logger.js';
 import { getConfig, setConfig } from './src/configStore.js';
 
@@ -91,7 +92,20 @@ const commands = [
   { name: 'kick', description: 'Kick a member from this VC', options: [{ name: 'user', type: 6, description: 'User to kick', required: true }] },
   { name: 'ban', description: 'Ban a member from re‑joining this VC', options: [{ name: 'user', type: 6, description: 'User to ban', required: true }] },
   { name: 'transfer', description: 'Transfer ownership to another member', options: [{ name: 'user', type: 6, description: 'New owner', required: true }] },
-  { name: 'setup', description: 'Initial bot setup (owner only)' }
+  { name: 'setup', description: 'Initial bot setup (owner only)' },
+  {
+    name: 'channelmsg',
+    description: 'Set the target text channel for console messages (owner only)',
+    options: [
+      {
+        name: 'channel',
+        type: 7, // CHANNEL
+        channel_types: [ChannelType.GuildText, ChannelType.GuildAnnouncement],
+        description: 'Select the text channel where console messages will be sent',
+        required: true
+      }
+    ]
+  }
 ];
 
 async function registerGuildCommands(guild) {
@@ -439,6 +453,23 @@ client.on('interactionCreate', async interaction => {
       return interaction.showModal(modal);
     }
 
+    // Owner‑only /channelmsg command
+    if (interaction.commandName === 'channelmsg') {
+      if (interaction.user.id !== interaction.guild.ownerId) {
+        return interaction.reply({ content: '❌ Only the server owner can run `/channelmsg`.', ephemeral: true });
+      }
+      const selectedChannel = interaction.options.getChannel('channel');
+      if (!selectedChannel || !selectedChannel.isTextBased()) {
+        return interaction.reply({ content: '❌ Please select a valid text channel.', ephemeral: true });
+      }
+      await setConfig(interaction.guild.id, { consoleChannelId: selectedChannel.id });
+      logger.info(`📢 Console message target set to #${selectedChannel.name} (${selectedChannel.id}) in ${interaction.guild.name}`);
+      return interaction.reply({
+        content: `✅ Console messages are now bound to <#${selectedChannel.id}>!\nType any message (or \`say <message>\`) in your server console to send it there.`,
+        ephemeral: true
+      });
+    }
+
     const targetVc = getTargetVc();
     if (!targetVc) {
       return interaction.reply({ content: '❌ Join your temporary voice channel first before using this command.', ephemeral: true });
@@ -679,6 +710,46 @@ client.on('channelDelete', async channel => {
     } catch (err) {
       logger.error(`Failed to recreate OpenCodeX channel: ${err}`);
     }
+  }
+});
+
+// -------------------------------------------------
+// Console Input Handler – send messages to /channelmsg target
+// -------------------------------------------------
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+  terminal: false
+});
+
+rl.on('line', async line => {
+  const input = line.trim();
+  if (!input) return;
+
+  // Strip optional "say " or "msg " prefix if the user types it
+  const messageContent = input.replace(/^(say|msg)\s+/i, '').trim();
+  if (!messageContent) return;
+
+  let sentCount = 0;
+  for (const guild of client.guilds.cache.values()) {
+    const cfg = await getConfig(guild.id);
+    if (cfg.consoleChannelId) {
+      const targetChannel = guild.channels.cache.get(cfg.consoleChannelId) ||
+        await guild.channels.fetch(cfg.consoleChannelId).catch(() => null);
+      if (targetChannel && targetChannel.isTextBased()) {
+        try {
+          await targetChannel.send({ content: messageContent });
+          logger.info(`💬 [Console -> #${targetChannel.name}]: ${messageContent}`);
+          sentCount++;
+        } catch (err) {
+          logger.error(`❌ Failed sending console message to #${targetChannel.name}: ${err.message}`);
+        }
+      }
+    }
+  }
+
+  if (sentCount === 0) {
+    logger.warn('⚠️ No target channel configured yet. Use /channelmsg in your Discord server first.');
   }
 });
 

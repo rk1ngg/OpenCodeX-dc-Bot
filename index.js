@@ -716,10 +716,16 @@ client.on('channelDelete', async channel => {
 // -------------------------------------------------
 // Console Input Handler – send messages to /channelmsg target
 // -------------------------------------------------
+process.stdin.resume();
+process.stdin.setEncoding('utf8');
+
 const rl = readline.createInterface({
   input: process.stdin,
-  output: process.stdout,
   terminal: false
+});
+
+rl.on('error', err => {
+  logger.error(`Console input error: ${err.message}`);
 });
 
 rl.on('line', async line => {

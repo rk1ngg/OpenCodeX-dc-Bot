@@ -1,0 +1,23 @@
+{
+  "name": "dc-opencodex-bot",
+  "version": "1.0.0",
+  "description": "OpenCodeX temporary voice channel Discord bot",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "discord",
+    "discord-bot",
+    "opencodex",
+    "voice-channel"
+  ],
+  "author": "RKINGG",
+  "license": "ISC",
+  "dependencies": {
+    "discord.js": "^14.18.0",
+    "winston": "^3.19.0",
+    "dotenv": "^16.4.5"
+  }
+}

@@ -16,6 +16,7 @@ import {
   ButtonStyle,
   StringSelectMenuBuilder,
   ChannelSelectMenuBuilder,
+  UserSelectMenuBuilder,
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
@@ -55,32 +56,42 @@ const client = new Client({
 // -------------------------------------------------
 // Helper UI builders (buttons & embeds)
 // -------------------------------------------------
-function createControlRows() {
+function createControlRows(hasPassword = false) {
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('lock').setLabel('Toggle Lock').setStyle(ButtonStyle.Secondary).setEmoji('🔒'),
+    new ButtonBuilder().setCustomId('allow_users').setLabel('Allow Users').setStyle(ButtonStyle.Secondary).setEmoji('✅'),
     new ButtonBuilder().setCustomId('limit').setLabel('Set Limit').setStyle(ButtonStyle.Secondary).setEmoji('👥'),
     new ButtonBuilder().setCustomId('invite').setLabel('Invite').setStyle(ButtonStyle.Secondary).setEmoji('📥')
   );
-  const row2 = new ActionRowBuilder().addComponents(
+  const row2Components = [
     new ButtonBuilder().setCustomId('kick').setLabel('Kick').setStyle(ButtonStyle.Secondary).setEmoji('❌'),
     new ButtonBuilder().setCustomId('ban').setLabel('Ban').setStyle(ButtonStyle.Secondary).setEmoji('🚫'),
     new ButtonBuilder().setCustomId('transfer').setLabel('Transfer').setStyle(ButtonStyle.Secondary).setEmoji('👑')
-  );
+  ];
+  if (hasPassword) {
+    row2Components.push(
+      new ButtonBuilder().setCustomId('enter_password').setLabel('Enter Password').setStyle(ButtonStyle.Primary).setEmoji('🔑')
+    );
+  }
+  const row2 = new ActionRowBuilder().addComponents(...row2Components);
   return [row1, row2];
 }
 
-function createControlEmbed(ownerId, displayName) {
+function createControlEmbed(ownerId, displayName, isLocked = false, hasPassword = false) {
+  const statusLine = isLocked
+    ? (hasPassword ? '🔐 **Status:** Locked (Password Protected)\n\n' : '🔒 **Status:** Locked (Private)\n\n')
+    : '🔓 **Status:** Unlocked (Public)\n\n';
   return new EmbedBuilder()
     .setTitle(`${displayName}'s Voice Channel Tools`)
     .setDescription(
-      `<@${ownerId}>, use this panel to manage your voice channel.\n\n` +
+      `<@${ownerId}>, use this panel to manage your voice channel.\n` +
+      statusLine +
       '🛠️ **Tools available:**\n' +
-      '- Lock / Unlock\n' +
-      '- Set user limit (0 = unlimited)\n' +
-      '- Generate one‑use invite\n' +
-      '- Kick members\n' +
-      '- Ban members (prevent re‑join)\n' +
-      '- Transfer ownership'
+      '- **Toggle Lock** (optional password protection)\n' +
+      '- **Allow Users** (searchable multi‑select whitelist)\n' +
+      '- **Set Limit** (0 = unlimited)\n' +
+      '- **Invite** (generate one‑use link)\n' +
+      '- **Kick / Ban / Transfer**'
     )
     .setColor(0x5865f2);
 }
@@ -311,17 +322,18 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
       return;
     }
 
-    // Record state
+    // Record state & send control panel
+    const panelMsg = await tempVc.send({ embeds: [createControlEmbed(member.id, displayName, false, false)], components: createControlRows(false) })
+      .catch(() => null);
+
     activeVcs.set(tempVc.id, {
       ownerId: member.id,
       creatorId: member.id,
       startTime: new Date(),
-      members: new Set([displayName])
+      members: new Set([displayName]),
+      password: null,
+      panelMessageId: panelMsg?.id || null
     });
-
-    // Send control panel
-    await tempVc.send({ embeds: [createControlEmbed(member.id, displayName)], components: createControlRows() })
-      .catch(() => {});
   }
 
   // Cleanup when a temporary VC becomes empty
@@ -392,6 +404,87 @@ client.on('interactionCreate', async interaction => {
       logger.error(`Failed to set user limit: ${err}`);
       return interaction.reply({ content: `❌ Failed to set limit: ${err.message}`, ephemeral: true });
     }
+  }
+
+  // Modal submit for locking VC with optional password
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_lock')) {
+    const explicitId = interaction.customId.split(':')[1];
+    const targetVc = (explicitId && interaction.guild.channels.cache.get(explicitId)) || getTargetVc();
+    if (!targetVc) {
+      return interaction.reply({ content: '❌ Voice channel not found.', ephemeral: true });
+    }
+    const rawPassword = interaction.fields.getTextInputValue('password_input').trim();
+    const hasPassword = rawPassword.length > 0;
+
+    await targetVc.permissionOverwrites.edit(interaction.guildId, {
+      Connect: false
+    });
+
+    let vcData = activeVcs.get(targetVc.id);
+    if (!vcData) {
+      vcData = {
+        ownerId: interaction.user.id,
+        creatorId: interaction.user.id,
+        startTime: new Date(),
+        members: new Set(),
+        password: null,
+        panelMessageId: null
+      };
+      activeVcs.set(targetVc.id, vcData);
+    }
+    vcData.password = hasPassword ? rawPassword : null;
+
+    // Refresh control panel so the "🔑 Enter Password" button appears if password-protected
+    const ownerMember = await interaction.guild.members.fetch(vcData.ownerId).catch(() => interaction.member);
+    const updatedEmbed = createControlEmbed(vcData.ownerId, ownerMember?.displayName || 'Owner', true, hasPassword);
+    const updatedRows = createControlRows(hasPassword);
+
+    if (vcData.panelMessageId) {
+      const panelMsg = await targetVc.messages.fetch(vcData.panelMessageId).catch(() => null);
+      if (panelMsg) await panelMsg.edit({ embeds: [updatedEmbed], components: updatedRows }).catch(() => {});
+    } else if (interaction.message) {
+      await interaction.message.edit({ embeds: [updatedEmbed], components: updatedRows }).catch(() => {});
+    }
+
+    return interaction.reply({
+      content: hasPassword
+        ? `🔐 <#${targetVc.id}> is now **locked with password** (\`${rawPassword}\`). Users can click **🔑 Enter Password** to unlock access!`
+        : `🔒 <#${targetVc.id}> is now **private** (no password).`,
+      ephemeral: true
+    });
+  }
+
+  // Modal submit for entering VC password
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_enter_password')) {
+    const explicitId = interaction.customId.split(':')[1];
+    const targetVc = (explicitId && interaction.guild.channels.cache.get(explicitId)) ||
+      (interaction.channel?.isVoiceBased?.() ? interaction.channel : null);
+    if (!targetVc) {
+      return interaction.reply({ content: '❌ Voice channel not found.', ephemeral: true });
+    }
+    const vcData = activeVcs.get(targetVc.id);
+    if (!vcData || !vcData.password) {
+      return interaction.reply({ content: 'ℹ️ This voice channel does not have an active password.', ephemeral: true });
+    }
+    const attempt = interaction.fields.getTextInputValue('password_attempt').trim();
+    if (attempt !== vcData.password) {
+      return interaction.reply({ content: '❌ **Incorrect password!** Access denied.', ephemeral: true });
+    }
+
+    await targetVc.permissionOverwrites.edit(interaction.user.id, {
+      ViewChannel: true,
+      Connect: true
+    });
+
+    // If the user is currently connected to another voice channel, move them in automatically!
+    if (interaction.member?.voice?.channelId && interaction.member.voice.channelId !== targetVc.id) {
+      await interaction.member.voice.setChannel(targetVc).catch(() => {});
+    }
+
+    return interaction.reply({
+      content: `✅ **Password accepted!** You now have access to join <#${targetVc.id}>.`,
+      ephemeral: true
+    });
   }
 
   // Modal submit for /setup
@@ -571,10 +664,34 @@ client.on('interactionCreate', async interaction => {
       case 'lock': {
         const everyoneOverwrite = targetVc.permissionOverwrites.cache.get(interaction.guildId);
         const currentlyLocked = everyoneOverwrite?.deny.has(PermissionFlagsBits.Connect);
-        await targetVc.permissionOverwrites.edit(interaction.guildId, {
-          Connect: currentlyLocked ? null : false
-        });
-        return interaction.reply({ content: currentlyLocked ? `🔓 <#${targetVc.id}> unlocked.` : `🔒 <#${targetVc.id}> is now private.`, ephemeral: true });
+        if (currentlyLocked) {
+          await targetVc.permissionOverwrites.edit(interaction.guildId, {
+            Connect: null
+          });
+          if (vcData) vcData.password = null;
+          const ownerMember = await interaction.guild.members.fetch(vcData?.ownerId || interaction.user.id).catch(() => interaction.member);
+          const updatedEmbed = createControlEmbed(vcData?.ownerId || interaction.user.id, ownerMember?.displayName || 'Owner', false, false);
+          if (vcData?.panelMessageId) {
+            const panelMsg = await targetVc.messages.fetch(vcData.panelMessageId).catch(() => null);
+            if (panelMsg) await panelMsg.edit({ embeds: [updatedEmbed], components: createControlRows(false) }).catch(() => {});
+          }
+          return interaction.reply({ content: `🔓 <#${targetVc.id}> unlocked (password cleared).`, ephemeral: true });
+        }
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_lock:${targetVc.id}`)
+          .setTitle('Lock Voice Channel')
+          .addComponents(
+            new ActionRowBuilder().addComponents(
+              new TextInputBuilder()
+                .setCustomId('password_input')
+                .setLabel('Optional Password (leave blank for none)')
+                .setStyle(TextInputStyle.Short)
+                .setMaxLength(32)
+                .setPlaceholder('Leave empty for normal lock, or type a password')
+                .setRequired(false)
+            )
+          );
+        return interaction.showModal(modal);
       }
       case 'limit': {
         const modal = new ModalBuilder()
@@ -634,6 +751,33 @@ client.on('interactionCreate', async interaction => {
 
   // Button handling
   if (interaction.isButton()) {
+    // Anyone can click "🔑 Enter Password" on a password-locked VC
+    if (interaction.customId === 'enter_password') {
+      const targetVc = interaction.channel?.isVoiceBased?.() ? interaction.channel : getTargetVc();
+      if (!targetVc) {
+        return interaction.reply({ content: '❌ Open the voice channel chat to click this button.', ephemeral: true });
+      }
+      const vcData = activeVcs.get(targetVc.id);
+      if (!vcData || !vcData.password) {
+        return interaction.reply({ content: 'ℹ️ This voice channel does not require a password right now.', ephemeral: true });
+      }
+      const modal = new ModalBuilder()
+        .setCustomId(`modal_enter_password:${targetVc.id}`)
+        .setTitle(`Enter Password for ${targetVc.name}`)
+        .addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('password_attempt')
+              .setLabel('Voice Channel Password')
+              .setStyle(TextInputStyle.Short)
+              .setMaxLength(32)
+              .setPlaceholder('Enter the password...')
+              .setRequired(true)
+          )
+        );
+      return interaction.showModal(modal);
+    }
+
     const targetVc = getTargetVc();
     if (!targetVc) {
       return interaction.reply({ content: '❌ Join the voice channel first to use these controls.', ephemeral: true });
@@ -651,10 +795,45 @@ client.on('interactionCreate', async interaction => {
       case 'lock': {
         const everyoneOverwrite = targetVc.permissionOverwrites.cache.get(interaction.guildId);
         const currentlyLocked = everyoneOverwrite?.deny.has(PermissionFlagsBits.Connect);
-        await targetVc.permissionOverwrites.edit(interaction.guildId, {
-          Connect: currentlyLocked ? null : false
+        if (currentlyLocked) {
+          await targetVc.permissionOverwrites.edit(interaction.guildId, {
+            Connect: null
+          });
+          if (vcData) vcData.password = null;
+          const ownerMember = await interaction.guild.members.fetch(vcData?.ownerId || interaction.user.id).catch(() => interaction.member);
+          const updatedEmbed = createControlEmbed(vcData?.ownerId || interaction.user.id, ownerMember?.displayName || 'Owner', false, false);
+          if (interaction.message) {
+            await interaction.message.edit({ embeds: [updatedEmbed], components: createControlRows(false) }).catch(() => {});
+          }
+          return interaction.reply({ content: `🔓 <#${targetVc.id}> unlocked (password cleared).`, ephemeral: true });
+        }
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_lock:${targetVc.id}`)
+          .setTitle('Lock Voice Channel')
+          .addComponents(
+            new ActionRowBuilder().addComponents(
+              new TextInputBuilder()
+                .setCustomId('password_input')
+                .setLabel('Optional Password (leave blank for none)')
+                .setStyle(TextInputStyle.Short)
+                .setMaxLength(32)
+                .setPlaceholder('Leave empty for normal lock, or type a password')
+                .setRequired(false)
+            )
+          );
+        return interaction.showModal(modal);
+      }
+      case 'allow_users': {
+        const userSelect = new UserSelectMenuBuilder()
+          .setCustomId(`vc_select_allow:${targetVc.id}`)
+          .setPlaceholder('Search & select users to allow into this VC...')
+          .setMinValues(1)
+          .setMaxValues(25);
+        return interaction.reply({
+          content: '✅ **Select users to whitelist (allow access even when locked):**\n*(Use the search bar or check multiple users below)*',
+          components: [new ActionRowBuilder().addComponents(userSelect)],
+          ephemeral: true
         });
-        return interaction.reply({ content: currentlyLocked ? `🔓 <#${targetVc.id}> unlocked.` : `🔒 <#${targetVc.id}> is now private.`, ephemeral: true });
       }
       case 'vc_limit':
       case 'limit': {
@@ -773,9 +952,31 @@ client.on('interactionCreate', async interaction => {
       await targetVc.permissionOverwrites.edit(member.id, { Connect: true, ManageChannels: true });
       await targetVc.setName(`${member.displayName}'s VC`).catch(() => {});
       if (vcData) vcData.ownerId = member.id;
-      await targetVc.send({ embeds: [createControlEmbed(member.id, member.displayName)], components: createControlRows() }).catch(() => {});
+      await targetVc.send({ embeds: [createControlEmbed(member.id, member.displayName)], components: createControlRows(Boolean(vcData?.password)) }).catch(() => {});
       return interaction.followUp({ content: `👑 Ownership transferred to ${member.displayName}.`, ephemeral: true });
     }
+  }
+
+  // UserSelectMenu handling for Allow Users (searchable multi-select whitelist)
+  if (interaction.isUserSelectMenu() && interaction.customId.startsWith('vc_select_allow')) {
+    const explicitId = interaction.customId.split(':')[1];
+    const targetVc = (explicitId && interaction.guild.channels.cache.get(explicitId)) || getTargetVc();
+    if (!targetVc) {
+      return interaction.reply({ content: '❌ Voice channel not found.', ephemeral: true });
+    }
+    await interaction.deferReply({ ephemeral: true });
+    const selectedUserIds = interaction.values;
+    for (const userId of selectedUserIds) {
+      await targetVc.permissionOverwrites.edit(userId, {
+        ViewChannel: true,
+        Connect: true
+      }).catch(() => {});
+    }
+    const mentions = selectedUserIds.map(id => `<@${id}>`).join(', ');
+    return interaction.followUp({
+      content: `✅ Allowed ${mentions} to join <#${targetVc.id}> even while locked!`,
+      ephemeral: true
+    });
   }
 
   // ChannelSelectMenu handling for /movechannel

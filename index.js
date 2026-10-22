@@ -15,6 +15,7 @@ import {
   ButtonBuilder,
   ButtonStyle,
   StringSelectMenuBuilder,
+  ChannelSelectMenuBuilder,
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
@@ -105,6 +106,10 @@ const commands = [
         required: true
       }
     ]
+  },
+  {
+    name: 'movechannel',
+    description: 'Move a text channel right below another channel (owner only)'
   }
 ];
 
@@ -179,6 +184,7 @@ async function ensureOpenCodeXChannel(guild, parentCategoryId = null) {
 // In‑memory state for temporary VCs
 // -------------------------------------------------
 const activeVcs = new Map(); // vcId -> {ownerId, creatorId, startTime, members:Set}
+const moveChannelState = new Map(); // userId -> { channelToMoveId, afterChannelId }
 
 // -------------------------------------------------
 // Ready & Guild Join events
@@ -470,6 +476,38 @@ client.on('interactionCreate', async interaction => {
       });
     }
 
+    // Owner‑only /movechannel command (2 dropdowns: 1st = channel to move, 2nd = after which channel)
+    if (interaction.commandName === 'movechannel') {
+      if (interaction.user.id !== interaction.guild.ownerId) {
+        return interaction.reply({ content: '❌ Only the server owner can run `/movechannel`.', ephemeral: true });
+      }
+      moveChannelState.set(interaction.user.id, { channelToMoveId: null, afterChannelId: null });
+
+      const row1 = new ActionRowBuilder().addComponents(
+        new ChannelSelectMenuBuilder()
+          .setCustomId('move_select_source')
+          .setPlaceholder('1️⃣ Select text channel to move')
+          .setChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+      );
+      const row2 = new ActionRowBuilder().addComponents(
+        new ChannelSelectMenuBuilder()
+          .setCustomId('move_select_after')
+          .setPlaceholder('2️⃣ Place right after (below) which channel?')
+          .setChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+      );
+
+      const embed = new EmbedBuilder()
+        .setTitle('🔀 Move Text Channel')
+        .setDescription(
+          'Select both channels from the dropdowns below; once both are selected, the channel will move automatically:\n\n' +
+          '**1️⃣ Channel to Move:** *Not selected*\n' +
+          '**2️⃣ Place After (Below):** *Not selected*'
+        )
+        .setColor(0x5865f2);
+
+      return interaction.reply({ embeds: [embed], components: [row1, row2], ephemeral: true });
+    }
+
     const targetVc = getTargetVc();
     if (!targetVc) {
       return interaction.reply({ content: '❌ Join your temporary voice channel first before using this command.', ephemeral: true });
@@ -692,6 +730,74 @@ client.on('interactionCreate', async interaction => {
       if (vcData) vcData.ownerId = member.id;
       await targetVc.send({ embeds: [createControlEmbed(member.id, member.displayName)], components: createControlRows() }).catch(() => {});
       return interaction.followUp({ content: `👑 Ownership transferred to ${member.displayName}.`, ephemeral: true });
+    }
+  }
+
+  // ChannelSelectMenu handling for /movechannel
+  if (interaction.isChannelSelectMenu() && (interaction.customId === 'move_select_source' || interaction.customId === 'move_select_after')) {
+    if (interaction.user.id !== interaction.guild.ownerId) {
+      return interaction.reply({ content: '❌ Only the server owner can use this menu.', ephemeral: true });
+    }
+    const state = moveChannelState.get(interaction.user.id) || { channelToMoveId: null, afterChannelId: null };
+    if (interaction.customId === 'move_select_source') {
+      state.channelToMoveId = interaction.values[0];
+    } else {
+      state.afterChannelId = interaction.values[0];
+    }
+    moveChannelState.set(interaction.user.id, state);
+
+    if (state.channelToMoveId && state.afterChannelId) {
+      if (state.channelToMoveId === state.afterChannelId) {
+        return interaction.reply({ content: '❌ Please choose two different channels.', ephemeral: true });
+      }
+      await interaction.deferUpdate();
+      const sourceChannel = interaction.guild.channels.cache.get(state.channelToMoveId) ||
+        await interaction.guild.channels.fetch(state.channelToMoveId).catch(() => null);
+      const afterChannel = interaction.guild.channels.cache.get(state.afterChannelId) ||
+        await interaction.guild.channels.fetch(state.afterChannelId).catch(() => null);
+
+      if (!sourceChannel || !afterChannel) {
+        return interaction.followUp({ content: '❌ Could not find one of the selected channels.', ephemeral: true });
+      }
+
+      // Move into the same category as the reference channel if different
+      if (sourceChannel.parentId !== afterChannel.parentId) {
+        await sourceChannel.setParent(afterChannel.parentId, { lockPermissions: false });
+      }
+
+      // Reorder all text/announcement channels in that category so sourceChannel sits right below afterChannel
+      const siblings = Array.from(
+        interaction.guild.channels.cache
+          .filter(c => c.parentId === afterChannel.parentId && (c.type === ChannelType.GuildText || c.type === ChannelType.GuildAnnouncement) && c.id !== sourceChannel.id)
+          .sort((a, b) => a.rawPosition - b.rawPosition)
+          .values()
+      );
+
+      const afterIndex = siblings.findIndex(c => c.id === afterChannel.id);
+      siblings.splice(afterIndex + 1, 0, sourceChannel);
+
+      await interaction.guild.channels.setPositions(
+        siblings.map((ch, idx) => ({ channel: ch.id, position: idx }))
+      );
+
+      moveChannelState.delete(interaction.user.id);
+
+      const doneEmbed = new EmbedBuilder()
+        .setTitle('✅ Channel Moved')
+        .setDescription(`Moved <#${sourceChannel.id}> right below <#${afterChannel.id}>!`)
+        .setColor(0x00ff00);
+
+      return interaction.editReply({ embeds: [doneEmbed], components: [] });
+    } else {
+      const updatedEmbed = new EmbedBuilder()
+        .setTitle('🔀 Move Text Channel')
+        .setDescription(
+          'Select both channels from the dropdowns below; once both are selected, the channel will move automatically:\n\n' +
+          `**1️⃣ Channel to Move:** ${state.channelToMoveId ? `<#${state.channelToMoveId}>` : '*Not selected*'}\n` +
+          `**2️⃣ Place After (Below):** ${state.afterChannelId ? `<#${state.afterChannelId}>` : '*Not selected*'}`
+        )
+        .setColor(0x5865f2);
+      return interaction.update({ embeds: [updatedEmbed] });
     }
   }
   } catch (err) {

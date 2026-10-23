@@ -326,21 +326,36 @@ function formatDuration(totalSeconds) {
   return `${secs}s`;
 }
 
-// Helper: Wipe all recent messages from a compromised/virus user across EVERY text-based channel in the guild
+// Helper: Wipe all recent messages from a compromised/virus user across EVERY text-based channel & thread in the guild
 async function wipeUserMessagesAcrossGuild(guild, userId, action = 'timeout') {
   let totalDeleted = 0;
   let channelsCleaned = 0;
+  let foundCount = 0;
+  let deleteErrors = 0;
 
   await guild.channels.fetch().catch(() => {});
-  const textChannels = guild.channels.cache.filter(c => c && typeof c.isTextBased === 'function' && c.isTextBased());
+  const activeThreads = await guild.channels.fetchActiveThreads().catch(() => null);
 
-  for (const channel of textChannels.values()) {
+  const channelMap = new Map();
+  for (const [id, ch] of guild.channels.cache.entries()) {
+    if (ch && typeof ch.isTextBased === 'function' && ch.isTextBased() && ch.messages) {
+      channelMap.set(id, ch);
+    }
+  }
+  if (activeThreads?.threads) {
+    for (const [id, th] of activeThreads.threads.entries()) {
+      if (th && th.messages) channelMap.set(id, th);
+    }
+  }
+
+  for (const channel of channelMap.values()) {
     try {
       const messages = await channel.messages.fetch({ limit: 100 }).catch(() => null);
       if (!messages) continue;
 
       const userMsgs = messages.filter(m => m.author?.id === userId);
       if (userMsgs.size === 0) continue;
+      foundCount += userMsgs.size;
 
       let deletedInChannel = 0;
       const twoWeeksMs = 14 * 24 * 60 * 60 * 1000;
@@ -352,20 +367,19 @@ async function wipeUserMessagesAcrossGuild(guild, userId, action = 'timeout') {
         if (deleted) {
           deletedInChannel += deleted.size;
         } else {
-          // Fallback to single delete if bulkDelete fails
           for (const msg of bulkEligible.values()) {
-            const ok = await msg.delete().then(() => true).catch(() => false);
+            const ok = await msg.delete().then(() => true).catch(() => { deleteErrors++; return false; });
             if (ok) deletedInChannel++;
           }
         }
       } else if (bulkEligible.size === 1) {
         const singleMsg = bulkEligible.first();
-        const ok = await singleMsg.delete().then(() => true).catch(() => false);
+        const ok = await singleMsg.delete().then(() => true).catch(() => { deleteErrors++; return false; });
         if (ok) deletedInChannel++;
       }
 
       for (const msg of olderMsgs.values()) {
-        const ok = await msg.delete().then(() => true).catch(() => false);
+        const ok = await msg.delete().then(() => true).catch(() => { deleteErrors++; return false; });
         if (ok) deletedInChannel++;
       }
 
@@ -374,6 +388,13 @@ async function wipeUserMessagesAcrossGuild(guild, userId, action = 'timeout') {
         channelsCleaned++;
       }
     } catch (_) {}
+  }
+
+  let deleteSummary = `\`${totalDeleted}\` across \`${channelsCleaned}\` channel(s)`;
+  if (foundCount > 0 && totalDeleted === 0 && deleteErrors > 0) {
+    deleteSummary = `\`0\` deleted out of \`${foundCount}\` found (⚠️ Enable **Manage Messages** permission on the Bot Role!)`;
+  } else if (foundCount === 0) {
+    deleteSummary = `\`0\` (No recent messages found from this user, or enable **Read Message History / View Channels** on Bot Role)`;
   }
 
   let actionResult = 'None (messages deleted only)';
@@ -415,7 +436,7 @@ async function wipeUserMessagesAcrossGuild(guild, userId, action = 'timeout') {
     }
   }
 
-  return { totalDeleted, channelsCleaned, actionResult };
+  return { totalDeleted, channelsCleaned, deleteSummary, actionResult };
 }
 
 // Track cross-channel spam (userId -> { text, channels: Set, firstTimestamp })
@@ -1281,7 +1302,7 @@ client.on('interactionCreate', async interaction => {
       const targetUser = interaction.options.getUser('user');
       const punishment = interaction.options.getString('action') || 'timeout';
       await interaction.deferReply();
-      const { totalDeleted, channelsCleaned, actionResult } = await wipeUserMessagesAcrossGuild(
+      const { deleteSummary, actionResult } = await wipeUserMessagesAcrossGuild(
         interaction.guild,
         targetUser.id,
         punishment
@@ -1290,7 +1311,7 @@ client.on('interactionCreate', async interaction => {
         .setTitle('🛡️ Anti-Virus / Cross-Channel Spam Cleanup Complete')
         .setDescription(
           `**Target User:** <@${targetUser.id}> (\`${targetUser.tag}\`)\n` +
-          `**Messages Deleted:** \`${totalDeleted}\` across \`${channelsCleaned}\` channel(s)\n` +
+          `**Messages Deleted:** ${deleteSummary}\n` +
           `**Action Taken:** ${actionResult}`
         )
         .setColor(0xe74c3c)
@@ -1984,7 +2005,7 @@ client.on('messageCreate', async message => {
       const targetUserId = userIdMatch[1];
       const validAction = ['timeout', 'kick', 'ban', 'none'].includes(actionArg) ? actionArg : 'timeout';
       const statusMsg = await message.reply(`🧹 Scanning all channels and wiping spam messages from <@${targetUserId}>...`);
-      const { totalDeleted, channelsCleaned, actionResult } = await wipeUserMessagesAcrossGuild(
+      const { deleteSummary, actionResult } = await wipeUserMessagesAcrossGuild(
         message.guild,
         targetUserId,
         validAction
@@ -1993,7 +2014,7 @@ client.on('messageCreate', async message => {
         .setTitle('🛡️ Anti-Virus / Cross-Channel Spam Cleanup Complete')
         .setDescription(
           `**Target User:** <@${targetUserId}>\n` +
-          `**Messages Deleted:** \`${totalDeleted}\` across \`${channelsCleaned}\` channel(s)\n` +
+          `**Messages Deleted:** ${deleteSummary}\n` +
           `**Action Taken:** ${actionResult}`
         )
         .setColor(0xe74c3c)

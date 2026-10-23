@@ -61,7 +61,7 @@ const client = new Client({
 // -------------------------------------------------
 // Helper UI builders (buttons & embeds)
 // -------------------------------------------------
-function createControlRows(hasPassword = false, isLocked = false) {
+function createControlRows() {
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('lock').setLabel('Toggle Lock').setStyle(ButtonStyle.Secondary).setEmoji('🔒'),
     new ButtonBuilder().setCustomId('allow_users').setLabel('Allow Users').setStyle(ButtonStyle.Secondary).setEmoji('✅'),
@@ -76,22 +76,7 @@ function createControlRows(hasPassword = false, isLocked = false) {
     new ButtonBuilder().setCustomId('transfer').setLabel('Transfer').setStyle(ButtonStyle.Secondary).setEmoji('👑'),
     new ButtonBuilder().setCustomId('mute_all').setLabel('Mute All').setStyle(ButtonStyle.Secondary).setEmoji('🔇')
   );
-  const rows = [row1, row2];
-  const row3Components = [];
-  if (isLocked) {
-    row3Components.push(
-      new ButtonBuilder().setCustomId('knock_vc').setLabel('Request to Join').setStyle(ButtonStyle.Secondary).setEmoji('🔔')
-    );
-  }
-  if (hasPassword) {
-    row3Components.push(
-      new ButtonBuilder().setCustomId('enter_password').setLabel('Enter Password').setStyle(ButtonStyle.Primary).setEmoji('🔑')
-    );
-  }
-  if (row3Components.length > 0) {
-    rows.push(new ActionRowBuilder().addComponents(...row3Components));
-  }
-  return rows;
+  return [row1, row2];
 }
 
 function createControlEmbed(ownerId, displayName, isLocked = false, hasPassword = false, isHidden = false) {
@@ -104,15 +89,114 @@ function createControlEmbed(ownerId, displayName, isLocked = false, hasPassword 
     .setDescription(
       `<@${ownerId}>, use this panel to manage your voice channel.\n` +
       `${lockText}${visibilityText}\n\n` +
-      '🛠️ **Tools available:**\n' +
+      '🛠️ **Owner Controls:**\n' +
       '- **Toggle Lock** (optional password protection)\n' +
       '- **Allow Users** (searchable multi‑select whitelist)\n' +
       '- **Set Limit** (0 = unlimited) & **Rename** VC\n' +
       '- **Hide/Show** (Ghost Mode) & **Mute All** (Party Mode)\n' +
-      '- **Invite / Kick / Ban / Transfer**\n' +
-      '- **Request to Join / Enter Password** (when locked)'
+      '- **Invite / Kick / Ban / Transfer**\n\n' +
+      '📘 *Live status, **Request to Join**, and **Enter Password** buttons are updated automatically in **#Session-logs**!*'
     )
     .setColor(0x5865f2);
+}
+
+// Live Session Log Embed & Buttons in #Session-logs (updates a single message per VC without flooding!)
+async function syncSessionLog(vc, vcData, isEnded = false) {
+  try {
+    if (!vc || !vc.guild) return;
+    const logChannel = vc.guild.channels.cache.find(
+      c => c.type === ChannelType.GuildText && (c.name === TEMP_TEXT_CHANNEL_NAME || c.name === LEGACY_LOG_CHANNEL_NAME)
+    );
+    if (!logChannel) return;
+
+    const everyoneOverwrite = vc.permissionOverwrites?.cache?.get(vc.guild.id);
+    const hasPassword = Boolean(vcData?.password);
+    const isLocked = hasPassword || Boolean(everyoneOverwrite?.deny?.has(PermissionFlagsBits.Connect));
+    const isHidden = Boolean(everyoneOverwrite?.deny?.has(PermissionFlagsBits.ViewChannel));
+
+    let ownerLine = vcData?.ownerId ? `<@${vcData.ownerId}>` : 'Unknown';
+    if (vcData?.creatorId && vcData?.ownerId && vcData.ownerId !== vcData.creatorId) {
+      ownerLine = `<@${vcData.ownerId}> *(created by <@${vcData.creatorId}>)*`;
+    }
+
+    const allParticipants = vcData?.members?.size ? Array.from(vcData.members).join(', ') : 'None';
+    let embed;
+    const components = [];
+
+    if (isEnded) {
+      const duration = vcData?.startTime ? Math.floor((Date.now() - vcData.startTime) / 60000) : 0;
+      embed = new EmbedBuilder()
+        .setTitle(`📘 Session Log – ${vc.name} (Ended)`)
+        .setColor(0x008080)
+        .setTimestamp()
+        .addFields(
+          { name: 'Voice Channel ID', value: vc.id, inline: true },
+          { name: 'Owner', value: ownerLine, inline: true },
+          { name: 'Status', value: '🔴 **Session Ended**', inline: true },
+          { name: 'Participants', value: allParticipants },
+          { name: 'Session Started', value: time(vcData?.startTime || new Date(), 'F'), inline: true },
+          { name: 'Session End', value: time(new Date(), 'F'), inline: true },
+          { name: 'Session Duration', value: `${duration} mins`, inline: true }
+        );
+    } else {
+      const activeMembersList = vc.members?.size > 0
+        ? Array.from(vc.members.values()).map(m => `<@${m.id}>`).join(', ')
+        : 'None';
+      const limitStr = vc.userLimit > 0 ? `${vc.members.size}/${vc.userLimit}` : `${vc.members.size} (Unlimited)`;
+      let statusStr = isLocked
+        ? (hasPassword ? '🔐 **Locked (Password)**' : '🔒 **Locked (Private)**')
+        : '🟢 **Unlocked (Public)**';
+      if (isHidden) statusStr += ' | 👻 **Hidden**';
+
+      embed = new EmbedBuilder()
+        .setTitle(`${isLocked ? '🔒' : '🟢'} Live Session – ${vc.name}`)
+        .setColor(isLocked ? (hasPassword ? 0xf1c40f : 0xe67e22) : 0x2ecc71)
+        .setTimestamp()
+        .addFields(
+          { name: 'Voice Channel', value: `<#${vc.id}>`, inline: true },
+          { name: 'Owner', value: ownerLine, inline: true },
+          { name: 'Status', value: statusStr, inline: true },
+          { name: `Active Members (${limitStr})`, value: activeMembersList },
+          { name: 'All Participants', value: allParticipants },
+          { name: 'Session Started', value: time(vcData?.startTime || new Date(), 'F') }
+        );
+
+      if (isLocked && !isHidden) {
+        const actionRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`knock_vc:${vc.id}`)
+            .setLabel('Request to Join')
+            .setStyle(ButtonStyle.Secondary)
+            .setEmoji('🔔')
+        );
+        if (hasPassword) {
+          actionRow.addComponents(
+            new ButtonBuilder()
+              .setCustomId(`enter_password:${vc.id}`)
+              .setLabel('Enter Password')
+              .setStyle(ButtonStyle.Primary)
+              .setEmoji('🔑')
+          );
+        }
+        components.push(actionRow);
+      }
+    }
+
+    if (vcData?.sessionLogMessageId) {
+      const existingMsg = await logChannel.messages.fetch(vcData.sessionLogMessageId).catch(() => null);
+      if (existingMsg) {
+        await existingMsg.edit({ embeds: [embed], components }).catch(() => {});
+        return;
+      }
+    }
+
+    const sentMsg = await logChannel.send({ embeds: [embed], components }).catch(() => null);
+    if (sentMsg && vcData) {
+      vcData.sessionLogMessageId = sentMsg.id;
+    }
+  } catch (err) {
+    logger.error(`syncSessionLog error: ${err.message}`);
+  }
 }
 
 // -------------------------------------------------
@@ -589,44 +673,14 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
       }
     }
   }
-  // Track members in active VCs & intercept unauthorized joins on password-protected VCs
+  // Track members joining active VCs & update live Session-logs card
   if (newState.channelId && activeVcs.has(newState.channelId)) {
     const data = activeVcs.get(newState.channelId);
     const member = newState.member;
-    const guild = newState.guild;
-
-    // Check if this VC has a password and the joining user is not authorized yet
-    const isAuthorized =
-      member.id === data.ownerId ||
-      data.allowedUsers?.has(member.id) ||
-      newState.channel.permissionOverwrites.cache.get(member.id)?.allow.has(PermissionFlagsBits.Connect);
-
-    if (data.password && !isAuthorized && !member.user.bot) {
-      // Immediately disconnect the user from voice so they cannot enter without entering the password first
-      await member.voice.disconnect().catch(() => {});
-
-      const passRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`enter_password:${newState.channelId}`)
-          .setLabel(`Enter Password for ${newState.channel.name}`)
-          .setStyle(ButtonStyle.Primary)
-          .setEmoji('🔑')
-      );
-
-      const promptEmbed = new EmbedBuilder()
-        .setTitle(`🔐 Password Required — ${newState.channel.name}`)
-        .setDescription(
-          `Hey <@${member.id}>! **${newState.channel.name}** is locked with a password.\n\n` +
-          `Click the **🔑 Enter Password** button below, enter the password, and you will be able to join <#${newState.channelId}>!`
-        )
-        .setColor(0xf1c40f);
-
-      await newState.channel.send({ content: `<@${member.id}>`, embeds: [promptEmbed], components: [passRow] }).catch(() => {});
-      await member.send({ embeds: [promptEmbed], components: [passRow] }).catch(() => {});
-      return;
+    if (member && !member.user.bot) {
+      data.members.add(member.displayName);
+      await syncSessionLog(newState.channel, data, false);
     }
-
-    data.members.add(member.displayName);
   }
 
   // User joins the generator channel
@@ -661,56 +715,43 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
       return;
     }
 
-    // Record state & send control panel
-    const panelMsg = await tempVc.send({ embeds: [createControlEmbed(member.id, displayName, false, false)], components: createControlRows(false) })
+    // Record state & send owner control panel inside VC Open Chat
+    const panelMsg = await tempVc.send({ embeds: [createControlEmbed(member.id, displayName, false, false)], components: createControlRows() })
       .catch(() => null);
 
-    activeVcs.set(tempVc.id, {
+    const vcData = {
       ownerId: member.id,
       creatorId: member.id,
       startTime: new Date(),
       members: new Set([displayName]),
       password: null,
       allowedUsers: new Set([member.id]),
-      panelMessageId: panelMsg?.id || null
-    });
+      panelMessageId: panelMsg?.id || null,
+      sessionLogMessageId: null
+    };
+    activeVcs.set(tempVc.id, vcData);
+
+    // Immediately create the live session card in #Session-logs
+    await syncSessionLog(tempVc, vcData, false);
   }
 
-  // Cleanup when a temporary VC becomes empty
+  // Update or finalize Session-logs when someone leaves a temporary VC
   const leftChannel = oldState.channel;
-  if (leftChannel) {
+  if (leftChannel && leftChannel.id !== newState.channelId) {
     const cfg = await getConfig(oldState.guild.id);
     const catName = cfg.setupCategoryName || DEFAULT_CATEGORY_NAME;
     const isTemp = activeVcs.has(leftChannel.id) ||
       (leftChannel.parent?.name === catName && leftChannel.name.endsWith("'s VC"));
 
-    if (isTemp && leftChannel.members.size === 0) {
+    if (isTemp) {
       const data = activeVcs.get(leftChannel.id);
-      activeVcs.delete(leftChannel.id);
-
-      const duration = data ? Math.floor((Date.now() - data.startTime) / 60000) : 0;
-      const participants = data?.members?.size ? Array.from(data.members).join(', ') : 'None';
-
-      const logEmbed = new EmbedBuilder()
-        .setTitle(`📘 Session Log – ${leftChannel.name}`)
-        .setColor(0x008080)
-        .setTimestamp()
-        .addFields({ name: 'Voice Channel ID', value: leftChannel.id })
-        .addFields({ name: 'Participants', value: participants })
-        .addFields({ name: 'Session End', value: time(new Date(), 'F') })
-        .addFields({ name: 'Session Duration', value: `${duration} mins` });
-
-      if (data?.creatorId) {
-        let ownerLine = `<@${data.creatorId}>`;
-        if (data.ownerId && data.ownerId !== data.creatorId) ownerLine += ` (transferred to <@${data.ownerId}>)`;
-        logEmbed.addFields({ name: 'Created by', value: ownerLine });
+      if (leftChannel.members.size === 0) {
+        activeVcs.delete(leftChannel.id);
+        await syncSessionLog(leftChannel, data, true);
+        await leftChannel.delete().catch(() => {});
+      } else if (data) {
+        await syncSessionLog(leftChannel, data, false);
       }
-
-      const logChannel = oldState.guild.channels.cache.find(
-        c => c.type === ChannelType.GuildText && (c.name === TEMP_TEXT_CHANNEL_NAME || c.name === LEGACY_LOG_CHANNEL_NAME)
-      );
-      if (logChannel) await logChannel.send({ embeds: [logEmbed] }).catch(() => {});
-      await leftChannel.delete().catch(() => {});
     }
   }
 });
@@ -815,6 +856,8 @@ client.on('interactionCreate', async interaction => {
     }
     try {
       await targetVc.setUserLimit(val);
+      const vcData = activeVcs.get(targetVc.id);
+      if (vcData) await syncSessionLog(targetVc, vcData, false);
       return interaction.reply({ content: val === 0 ? `👥 Limit removed (unlimited) for <#${targetVc.id}>.` : `👥 Limit set to **${val}** for <#${targetVc.id}>.`, ephemeral: true });
     } catch (err) {
       logger.error(`Failed to set user limit: ${err}`);
@@ -832,10 +875,9 @@ client.on('interactionCreate', async interaction => {
     const rawPassword = interaction.fields.getTextInputValue('password_input').trim();
     const hasPassword = rawPassword.length > 0;
 
-    // If password is set, keep Connect: true on @everyone so clicking the VC triggers voiceStateUpdate
-    // which immediately intercepts the user into the Waiting Room and sends them the password prompt!
+    // Lock the VC (@everyone Connect: false) – users can Request to Join or Enter Password in #Session-logs!
     await targetVc.permissionOverwrites.edit(interaction.guildId, {
-      Connect: hasPassword ? true : false
+      Connect: false
     });
 
     let vcData = activeVcs.get(targetVc.id);
@@ -844,21 +886,22 @@ client.on('interactionCreate', async interaction => {
         ownerId: interaction.user.id,
         creatorId: interaction.user.id,
         startTime: new Date(),
-        members: new Set(),
+        members: new Set(Array.from(targetVc.members.values()).map(m => m.displayName)),
         password: null,
         allowedUsers: new Set([interaction.user.id]),
-        panelMessageId: null
+        panelMessageId: null,
+        sessionLogMessageId: null
       };
       activeVcs.set(targetVc.id, vcData);
     }
     if (!vcData.allowedUsers) vcData.allowedUsers = new Set([vcData.ownerId]);
     vcData.password = hasPassword ? rawPassword : null;
 
-    // Refresh control panel so the "🔑 Enter Password" and "🔔 Request to Join" buttons appear
+    // Refresh owner control panel in VC chat
     const ownerMember = await interaction.guild.members.fetch(vcData.ownerId).catch(() => interaction.member);
     const isHidden = Boolean(targetVc.permissionOverwrites.cache.get(interaction.guildId)?.deny.has(PermissionFlagsBits.ViewChannel));
     const updatedEmbed = createControlEmbed(vcData.ownerId, ownerMember?.displayName || 'Owner', true, hasPassword, isHidden);
-    const updatedRows = createControlRows(hasPassword, true);
+    const updatedRows = createControlRows();
 
     if (vcData.panelMessageId) {
       const panelMsg = await targetVc.messages.fetch(vcData.panelMessageId).catch(() => null);
@@ -867,10 +910,13 @@ client.on('interactionCreate', async interaction => {
       await interaction.message.edit({ embeds: [updatedEmbed], components: updatedRows }).catch(() => {});
     }
 
+    // Update the single live card in #Session-logs with Request to Join & Enter Password buttons
+    await syncSessionLog(targetVc, vcData, false);
+
     return interaction.reply({
       content: hasPassword
-        ? `🔐 <#${targetVc.id}> is now **locked with password** (\`${rawPassword}\`). Users can click **🔑 Enter Password** to unlock access!`
-        : `🔒 <#${targetVc.id}> is now **private** (no password).`,
+        ? `🔐 <#${targetVc.id}> is now **locked with password** (\`${rawPassword}\`).\nUsers can click **🔑 Enter Password** or **🔔 Request to Join** on your live card in **#Session-logs**!`
+        : `🔒 <#${targetVc.id}> is now **private**. Users can click **🔔 Request to Join** on your live card in **#Session-logs**!`,
       ephemeral: true
     });
   }
@@ -888,6 +934,8 @@ client.on('interactionCreate', async interaction => {
     }
     try {
       await targetVc.setName(newName);
+      const vcData = activeVcs.get(targetVc.id);
+      if (vcData) await syncSessionLog(targetVc, vcData, false);
       return interaction.reply({ content: `✏️ Voice channel renamed to **${newName}**!`, ephemeral: true });
     } catch (err) {
       return interaction.reply({ content: `❌ Failed to rename VC: ${err.message}`, ephemeral: true });
@@ -1325,8 +1373,9 @@ client.on('interactionCreate', async interaction => {
           const updatedEmbed = createControlEmbed(vcData?.ownerId || interaction.user.id, ownerMember?.displayName || 'Owner', false, false);
           if (vcData?.panelMessageId) {
             const panelMsg = await targetVc.messages.fetch(vcData.panelMessageId).catch(() => null);
-            if (panelMsg) await panelMsg.edit({ embeds: [updatedEmbed], components: createControlRows(false, false) }).catch(() => {});
+            if (panelMsg) await panelMsg.edit({ embeds: [updatedEmbed], components: createControlRows() }).catch(() => {});
           }
+          if (vcData) await syncSessionLog(targetVc, vcData, false);
           return interaction.reply({ content: `🔓 <#${targetVc.id}> unlocked (password cleared).`, ephemeral: true });
         }
         const modal = new ModalBuilder()
@@ -1394,13 +1443,17 @@ client.on('interactionCreate', async interaction => {
         await targetVc.permissionOverwrites.edit(newOwnerId, { Connect: true, ManageChannels: true });
         const newOwner = await interaction.guild.members.fetch(newOwnerId);
         await targetVc.setName(`${newOwner.displayName}'s VC`).catch(() => {});
-        if (vcData) vcData.ownerId = newOwnerId;
-        await targetVc.send({ embeds: [createControlEmbed(newOwnerId, newOwner.displayName)], components: createControlRows(Boolean(vcData?.password)) }).catch(() => {});
+        if (vcData) {
+          vcData.ownerId = newOwnerId;
+          await syncSessionLog(targetVc, vcData, false);
+        }
+        await targetVc.send({ embeds: [createControlEmbed(newOwnerId, newOwner.displayName)], components: createControlRows() }).catch(() => {});
         return interaction.reply({ content: `👑 Ownership transferred to <@${newOwnerId}>.`, ephemeral: true });
       }
       case 'rename': {
         const newName = interaction.options.getString('name').trim();
         await targetVc.setName(newName);
+        if (vcData) await syncSessionLog(targetVc, vcData, false);
         return interaction.reply({ content: `✏️ Voice channel renamed to **${newName}**!`, ephemeral: true });
       }
       case 'hide': {
@@ -1409,6 +1462,7 @@ client.on('interactionCreate', async interaction => {
         await targetVc.permissionOverwrites.edit(interaction.guildId, {
           ViewChannel: currentlyHidden ? null : false
         });
+        if (vcData) await syncSessionLog(targetVc, vcData, false);
         return interaction.reply({
           content: currentlyHidden
             ? `👁️ <#${targetVc.id}> is now **visible** to the server.`
@@ -1470,18 +1524,23 @@ client.on('interactionCreate', async interaction => {
       return interaction.showModal(modal);
     }
 
-    // Anyone can click "🔔 Request to Join" (Knock) on a locked VC
-    if (interaction.customId === 'knock_vc') {
-      const targetVc = interaction.channel?.isVoiceBased?.() ? interaction.channel : getTargetVc();
+    // Anyone can click "🔔 Request to Join" (Knock) in #Session-logs (or VC chat) on a locked VC
+    if (interaction.customId === 'knock_vc' || interaction.customId.startsWith('knock_vc:')) {
+      const explicitVcId = interaction.customId.includes(':') ? interaction.customId.split(':')[1] : null;
+      const targetVc = (explicitVcId && interaction.guild.channels.cache.get(explicitVcId)) ||
+        (interaction.channel?.isVoiceBased?.() ? interaction.channel : getTargetVc());
       if (!targetVc) {
-        return interaction.reply({ content: '❌ Open the voice channel chat to click this button.', ephemeral: true });
+        return interaction.reply({ content: '❌ Voice channel no longer exists.', ephemeral: true });
       }
       const vcData = activeVcs.get(targetVc.id);
+      if (targetVc.members.has(interaction.user.id)) {
+        return interaction.reply({ content: 'ℹ️ You are already inside this voice channel!', ephemeral: true });
+      }
       const ownerId = vcData?.ownerId || interaction.guild.ownerId;
       const knockRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId(`knock_accept:${targetVc.id}:${interaction.user.id}`)
-          .setLabel('Accept & Allow')
+          .setLabel('Allow to Join')
           .setStyle(ButtonStyle.Success)
           .setEmoji('✅'),
         new ButtonBuilder()
@@ -1491,13 +1550,16 @@ client.on('interactionCreate', async interaction => {
           .setEmoji('✖️')
       );
       await targetVc.send({
-        content: `🔔 <@${ownerId}>, **<@${interaction.user.id}>** is knocking and requesting to join <#${targetVc.id}>!`,
+        content: `🔔 <@${ownerId}>, **<@${interaction.user.id}>** is requesting to join <#${targetVc.id}>!`,
         components: [knockRow]
       }).catch(() => {});
-      return interaction.reply({ content: `🔔 Knock sent! Waiting for the VC owner to accept your request.`, ephemeral: true });
+      return interaction.reply({
+        content: `🔔 Join request sent to <@${ownerId}> in <#${targetVc.id}>'s Open Chat!`,
+        ephemeral: true
+      });
     }
 
-    // Handle Knock Accept / Deny buttons (VC owner or Server Owner)
+    // Handle Knock Accept / Deny buttons inside VC Owner's Open Chat
     if (interaction.customId.startsWith('knock_accept:') || interaction.customId.startsWith('knock_deny:')) {
       const [actionType, vcId, requesterId] = interaction.customId.split(':');
       const targetVc = interaction.guild.channels.cache.get(vcId) || getTargetVc();
@@ -1520,8 +1582,11 @@ client.on('interactionCreate', async interaction => {
           Connect: true
         }).catch(() => {});
         const reqMember = await interaction.guild.members.fetch(requesterId).catch(() => null);
-        if (reqMember?.voice?.channelId && reqMember.voice.channelId !== targetVc.id) {
-          await reqMember.voice.setChannel(targetVc).catch(() => {});
+        if (reqMember) {
+          if (reqMember.voice?.channelId && reqMember.voice.channelId !== targetVc.id) {
+            await reqMember.voice.setChannel(targetVc).catch(() => {});
+          }
+          await reqMember.send(`✅ <@${interaction.user.id}> accepted your request! You can now join <#${targetVc.id}>.`).catch(() => {});
         }
         return interaction.update({
           content: `✅ Allowed <@${requesterId}> to join <#${targetVc.id}>!`,
@@ -1561,8 +1626,9 @@ client.on('interactionCreate', async interaction => {
           const ownerMember = await interaction.guild.members.fetch(vcData?.ownerId || interaction.user.id).catch(() => interaction.member);
           const updatedEmbed = createControlEmbed(vcData?.ownerId || interaction.user.id, ownerMember?.displayName || 'Owner', false, false, isHidden);
           if (interaction.message) {
-            await interaction.message.edit({ embeds: [updatedEmbed], components: createControlRows(false, false) }).catch(() => {});
+            await interaction.message.edit({ embeds: [updatedEmbed], components: createControlRows() }).catch(() => {});
           }
+          if (vcData) await syncSessionLog(targetVc, vcData, false);
           return interaction.reply({ content: `🔓 <#${targetVc.id}> unlocked (password cleared).`, ephemeral: true });
         }
         const modal = new ModalBuilder()
@@ -1613,15 +1679,16 @@ client.on('interactionCreate', async interaction => {
       case 'hide_vc': {
         const everyoneOverwrite = targetVc.permissionOverwrites.cache.get(interaction.guildId);
         const currentlyHidden = everyoneOverwrite?.deny.has(PermissionFlagsBits.ViewChannel);
-        const currentlyLocked = Boolean(everyoneOverwrite?.deny.has(PermissionFlagsBits.Connect));
+        const currentlyLocked = Boolean(vcData?.password) || Boolean(everyoneOverwrite?.deny.has(PermissionFlagsBits.Connect));
         await targetVc.permissionOverwrites.edit(interaction.guildId, {
           ViewChannel: currentlyHidden ? null : false
         });
         const ownerMember = await interaction.guild.members.fetch(vcData?.ownerId || interaction.user.id).catch(() => interaction.member);
         const updatedEmbed = createControlEmbed(vcData?.ownerId || interaction.user.id, ownerMember?.displayName || 'Owner', currentlyLocked, Boolean(vcData?.password), !currentlyHidden);
         if (interaction.message) {
-          await interaction.message.edit({ embeds: [updatedEmbed], components: createControlRows(Boolean(vcData?.password), currentlyLocked) }).catch(() => {});
+          await interaction.message.edit({ embeds: [updatedEmbed], components: createControlRows() }).catch(() => {});
         }
+        if (vcData) await syncSessionLog(targetVc, vcData, false);
         return interaction.reply({
           content: currentlyHidden
             ? `👁️ <#${targetVc.id}> is now **visible** to the server.`
@@ -1761,8 +1828,11 @@ client.on('interactionCreate', async interaction => {
       await targetVc.permissionOverwrites.delete(oldOwnerId).catch(() => {});
       await targetVc.permissionOverwrites.edit(member.id, { Connect: true, ManageChannels: true });
       await targetVc.setName(`${member.displayName}'s VC`).catch(() => {});
-      if (vcData) vcData.ownerId = member.id;
-      await targetVc.send({ embeds: [createControlEmbed(member.id, member.displayName)], components: createControlRows(Boolean(vcData?.password)) }).catch(() => {});
+      if (vcData) {
+        vcData.ownerId = member.id;
+        await syncSessionLog(targetVc, vcData, false);
+      }
+      await targetVc.send({ embeds: [createControlEmbed(member.id, member.displayName)], components: createControlRows() }).catch(() => {});
       return interaction.followUp({ content: `👑 Ownership transferred to ${member.displayName}.`, ephemeral: true });
     }
   }

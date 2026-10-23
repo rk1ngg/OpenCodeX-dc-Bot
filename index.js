@@ -26,8 +26,12 @@ import {
   time
 } from 'discord.js';
 import readline from 'readline';
+import { exec } from 'child_process';
+import { promisify } from 'util';
 import logger from './src/logger.js';
 import { getConfig, setConfig } from './src/configStore.js';
+
+const execAsync = promisify(exec);
 
 const TOKEN = process.env.TOKEN;
 if (!TOKEN) {
@@ -56,42 +60,55 @@ const client = new Client({
 // -------------------------------------------------
 // Helper UI builders (buttons & embeds)
 // -------------------------------------------------
-function createControlRows(hasPassword = false) {
+function createControlRows(hasPassword = false, isLocked = false) {
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('lock').setLabel('Toggle Lock').setStyle(ButtonStyle.Secondary).setEmoji('🔒'),
     new ButtonBuilder().setCustomId('allow_users').setLabel('Allow Users').setStyle(ButtonStyle.Secondary).setEmoji('✅'),
     new ButtonBuilder().setCustomId('limit').setLabel('Set Limit').setStyle(ButtonStyle.Secondary).setEmoji('👥'),
-    new ButtonBuilder().setCustomId('invite').setLabel('Invite').setStyle(ButtonStyle.Secondary).setEmoji('📥')
+    new ButtonBuilder().setCustomId('rename_vc').setLabel('Rename').setStyle(ButtonStyle.Secondary).setEmoji('✏️'),
+    new ButtonBuilder().setCustomId('hide_vc').setLabel('Hide/Show').setStyle(ButtonStyle.Secondary).setEmoji('👻')
   );
-  const row2Components = [
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('invite').setLabel('Invite').setStyle(ButtonStyle.Secondary).setEmoji('📥'),
     new ButtonBuilder().setCustomId('kick').setLabel('Kick').setStyle(ButtonStyle.Secondary).setEmoji('❌'),
     new ButtonBuilder().setCustomId('ban').setLabel('Ban').setStyle(ButtonStyle.Secondary).setEmoji('🚫'),
-    new ButtonBuilder().setCustomId('transfer').setLabel('Transfer').setStyle(ButtonStyle.Secondary).setEmoji('👑')
+    new ButtonBuilder().setCustomId('transfer').setLabel('Transfer').setStyle(ButtonStyle.Secondary).setEmoji('👑'),
+    new ButtonBuilder().setCustomId('mute_all').setLabel('Mute All').setStyle(ButtonStyle.Secondary).setEmoji('🔇')
+  );
+  const row3Components = [
+    new ButtonBuilder().setCustomId('claim_vc').setLabel('Claim VC').setStyle(ButtonStyle.Success).setEmoji('🙋‍♂️')
   ];
+  if (isLocked) {
+    row3Components.push(
+      new ButtonBuilder().setCustomId('knock_vc').setLabel('Request to Join').setStyle(ButtonStyle.Secondary).setEmoji('🔔')
+    );
+  }
   if (hasPassword) {
-    row2Components.push(
+    row3Components.push(
       new ButtonBuilder().setCustomId('enter_password').setLabel('Enter Password').setStyle(ButtonStyle.Primary).setEmoji('🔑')
     );
   }
-  const row2 = new ActionRowBuilder().addComponents(...row2Components);
-  return [row1, row2];
+  const row3 = new ActionRowBuilder().addComponents(...row3Components);
+  return [row1, row2, row3];
 }
 
-function createControlEmbed(ownerId, displayName, isLocked = false, hasPassword = false) {
-  const statusLine = isLocked
-    ? (hasPassword ? '🔐 **Status:** Locked (Password Protected)\n\n' : '🔒 **Status:** Locked (Private)\n\n')
-    : '🔓 **Status:** Unlocked (Public)\n\n';
+function createControlEmbed(ownerId, displayName, isLocked = false, hasPassword = false, isHidden = false) {
+  const lockText = isLocked
+    ? (hasPassword ? '🔐 **Locked (Password Protected)**' : '🔒 **Locked (Private)**')
+    : '🔓 **Unlocked (Public)**';
+  const visibilityText = isHidden ? ' | 👻 **Hidden (Ghost Mode)**' : '';
   return new EmbedBuilder()
     .setTitle(`${displayName}'s Voice Channel Tools`)
     .setDescription(
       `<@${ownerId}>, use this panel to manage your voice channel.\n` +
-      statusLine +
+      `${lockText}${visibilityText}\n\n` +
       '🛠️ **Tools available:**\n' +
       '- **Toggle Lock** (optional password protection)\n' +
       '- **Allow Users** (searchable multi‑select whitelist)\n' +
-      '- **Set Limit** (0 = unlimited)\n' +
-      '- **Invite** (generate one‑use link)\n' +
-      '- **Kick / Ban / Transfer**'
+      '- **Set Limit** (0 = unlimited) & **Rename** VC\n' +
+      '- **Hide/Show** (Ghost Mode) & **Mute All** (Party Mode)\n' +
+      '- **Invite / Kick / Ban / Transfer**\n' +
+      '- **Claim VC** (if owner left) & **Request to Join / Enter Password**'
     )
     .setColor(0x5865f2);
 }
@@ -139,6 +156,61 @@ const commands = [
         type: 7, // CHANNEL
         channel_types: [ChannelType.GuildText, ChannelType.GuildAnnouncement],
         description: 'Optional target channel (defaults to /channelmsg channel)',
+        required: false
+      }
+    ]
+  },
+  { name: 'rename', description: 'Rename your temporary VC', options: [{ name: 'name', type: 3, description: 'New VC name', required: true }] },
+  { name: 'hide', description: 'Toggle Ghost Mode (hide/show VC from channel list)' },
+  { name: 'claim', description: 'Claim ownership of the current temporary VC if the owner left' },
+  { name: 'muteall', description: 'Server-mute or unmute everyone inside this VC' },
+  {
+    name: 'embed',
+    description: 'Open an interactive Embed Announcement builder (owner only)',
+    options: [
+      {
+        name: 'channel',
+        type: 7, // CHANNEL
+        channel_types: [ChannelType.GuildText, ChannelType.GuildAnnouncement],
+        description: 'Target text channel (defaults to /channelmsg or current channel)',
+        required: false
+      }
+    ]
+  },
+  {
+    name: 'purge',
+    description: 'Bulk delete 1–100 messages in this channel (owner only)',
+    options: [
+      {
+        name: 'amount',
+        type: 4, // INTEGER
+        description: 'Number of messages to delete (1–100)',
+        required: true
+      }
+    ]
+  },
+  { name: 'updatebot', description: 'Pull latest code from GitHub and restart the bot (owner only)' },
+  { name: 'vcleaderboard', description: 'Show the Top 10 most active members in Voice Channels' },
+  {
+    name: 'vcstats',
+    description: 'View voice channel activity stats for a user',
+    options: [
+      {
+        name: 'user',
+        type: 6, // USER
+        description: 'User to check (defaults to yourself)',
+        required: false
+      }
+    ]
+  },
+  {
+    name: 'autorole',
+    description: 'Set or disable an automatic role for new members joining the server (owner only)',
+    options: [
+      {
+        name: 'role',
+        type: 8, // ROLE
+        description: 'Role to automatically give (leave empty to disable)',
         required: false
       }
     ]
@@ -217,6 +289,16 @@ async function ensureOpenCodeXChannel(guild, parentCategoryId = null) {
 // -------------------------------------------------
 const activeVcs = new Map(); // vcId -> {ownerId, creatorId, startTime, members:Set}
 const moveChannelState = new Map(); // userId -> { channelToMoveId, afterChannelId }
+const vcSessionJoinTimes = new Map(); // `${guildId}:${userId}` -> timestamp ms
+
+function formatDuration(totalSeconds) {
+  const hrs = Math.floor(totalSeconds / 3600);
+  const mins = Math.floor((totalSeconds % 3600) / 60);
+  const secs = Math.floor(totalSeconds % 60);
+  if (hrs > 0) return `${hrs}h ${mins}m ${secs}s`;
+  if (mins > 0) return `${mins}m ${secs}s`;
+  return `${secs}s`;
+}
 
 // -------------------------------------------------
 // Ready & Guild Join events
@@ -280,10 +362,47 @@ client.on('guildCreate', async guild => {
   }
 });
 
+client.on('guildMemberAdd', async member => {
+  try {
+    const cfg = await getConfig(member.guild.id);
+    if (cfg.autoRoleId) {
+      const role = member.guild.roles.cache.get(cfg.autoRoleId) ||
+        await member.guild.roles.fetch(cfg.autoRoleId).catch(() => null);
+      if (role) {
+        await member.roles.add(role);
+        logger.info(`🎭 Assigned auto-role @${role.name} to ${member.user.tag} in ${member.guild.name}`);
+      }
+    }
+  } catch (err) {
+    logger.error(`Auto-role error in ${member.guild.name}: ${err.message}`);
+  }
+});
+
 // -------------------------------------------------
-// Voice state handling – create temporary VCs
+// Voice state handling – create temporary VCs & track VC leaderboard stats
 // -------------------------------------------------
 client.on('voiceStateUpdate', async (oldState, newState) => {
+  // Track VC time for /vcleaderboard and /vcstats
+  const userObj = newState.member?.user || oldState.member?.user;
+  if (userObj && !userObj.bot) {
+    const guildId = newState.guild.id;
+    const key = `${guildId}:${userObj.id}`;
+    if (!oldState.channelId && newState.channelId) {
+      vcSessionJoinTimes.set(key, Date.now());
+    } else if (oldState.channelId && !newState.channelId) {
+      const joinedAt = vcSessionJoinTimes.get(key);
+      if (joinedAt) {
+        vcSessionJoinTimes.delete(key);
+        const elapsedSec = Math.floor((Date.now() - joinedAt) / 1000);
+        if (elapsedSec > 0) {
+          const cfg = await getConfig(guildId);
+          const vcStats = cfg.vcStats || {};
+          vcStats[userObj.id] = (vcStats[userObj.id] || 0) + elapsedSec;
+          await setConfig(guildId, { vcStats });
+        }
+      }
+    }
+  }
   // Track members in active VCs
   if (newState.channelId && activeVcs.has(newState.channelId)) {
     const data = activeVcs.get(newState.channelId);
@@ -434,10 +553,11 @@ client.on('interactionCreate', async interaction => {
     }
     vcData.password = hasPassword ? rawPassword : null;
 
-    // Refresh control panel so the "🔑 Enter Password" button appears if password-protected
+    // Refresh control panel so the "🔑 Enter Password" and "🔔 Request to Join" buttons appear
     const ownerMember = await interaction.guild.members.fetch(vcData.ownerId).catch(() => interaction.member);
-    const updatedEmbed = createControlEmbed(vcData.ownerId, ownerMember?.displayName || 'Owner', true, hasPassword);
-    const updatedRows = createControlRows(hasPassword);
+    const isHidden = Boolean(targetVc.permissionOverwrites.cache.get(interaction.guildId)?.deny.has(PermissionFlagsBits.ViewChannel));
+    const updatedEmbed = createControlEmbed(vcData.ownerId, ownerMember?.displayName || 'Owner', true, hasPassword, isHidden);
+    const updatedRows = createControlRows(hasPassword, true);
 
     if (vcData.panelMessageId) {
       const panelMsg = await targetVc.messages.fetch(vcData.panelMessageId).catch(() => null);
@@ -485,6 +605,71 @@ client.on('interactionCreate', async interaction => {
       content: `✅ **Password accepted!** You now have access to join <#${targetVc.id}>.`,
       ephemeral: true
     });
+  }
+
+  // Modal submit for renaming VC
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_rename')) {
+    const explicitId = interaction.customId.split(':')[1];
+    const targetVc = (explicitId && interaction.guild.channels.cache.get(explicitId)) || getTargetVc();
+    if (!targetVc) {
+      return interaction.reply({ content: '❌ Voice channel not found.', ephemeral: true });
+    }
+    const newName = interaction.fields.getTextInputValue('rename_input').trim();
+    if (!newName) {
+      return interaction.reply({ content: '❌ Channel name cannot be empty.', ephemeral: true });
+    }
+    try {
+      await targetVc.setName(newName);
+      return interaction.reply({ content: `✏️ Voice channel renamed to **${newName}**!`, ephemeral: true });
+    } catch (err) {
+      return interaction.reply({ content: `❌ Failed to rename VC: ${err.message}`, ephemeral: true });
+    }
+  }
+
+  // Modal submit for /embed builder
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_embed')) {
+    const explicitChannelId = interaction.customId.split(':')[1];
+    let targetChannel = explicitChannelId
+      ? (interaction.guild.channels.cache.get(explicitChannelId) || await interaction.guild.channels.fetch(explicitChannelId).catch(() => null))
+      : null;
+
+    if (!targetChannel) {
+      const cfg = await getConfig(interaction.guild.id);
+      if (cfg.consoleChannelId) {
+        targetChannel = interaction.guild.channels.cache.get(cfg.consoleChannelId) ||
+          await interaction.guild.channels.fetch(cfg.consoleChannelId).catch(() => null);
+      } else {
+        targetChannel = interaction.channel;
+      }
+    }
+
+    if (!targetChannel || !targetChannel.isTextBased()) {
+      return interaction.reply({ content: '❌ Target text channel not found.', ephemeral: true });
+    }
+
+    const title = interaction.fields.getTextInputValue('embed_title').trim();
+    const description = interaction.fields.getTextInputValue('embed_desc').trim();
+    const colorInput = interaction.fields.getTextInputValue('embed_color').trim();
+    const imageUrl = interaction.fields.getTextInputValue('embed_image').trim();
+    const footerText = interaction.fields.getTextInputValue('embed_footer').trim();
+
+    let colorHex = 0x5865f2;
+    if (colorInput) {
+      const parsed = parseInt(colorInput.replace(/^#/, ''), 16);
+      if (!isNaN(parsed)) colorHex = parsed;
+    }
+
+    const embed = new EmbedBuilder()
+      .setDescription(description)
+      .setColor(colorHex)
+      .setTimestamp();
+
+    if (title) embed.setTitle(title);
+    if (imageUrl && /^https?:\/\//i.test(imageUrl)) embed.setImage(imageUrl);
+    if (footerText) embed.setFooter({ text: footerText });
+
+    await targetChannel.send({ embeds: [embed] });
+    return interaction.reply({ content: `✅ Embed announcement sent to <#${targetChannel.id}>!`, ephemeral: true });
   }
 
   // Modal submit for /setup
@@ -646,12 +831,192 @@ client.on('interactionCreate', async interaction => {
       return interaction.reply({ content: `✅ Sent to <#${targetChannel.id}>!`, ephemeral: true });
     }
 
+    // Owner‑only /embed interactive announcement builder
+    if (interaction.commandName === 'embed') {
+      if (interaction.user.id !== interaction.guild.ownerId) {
+        return interaction.reply({ content: '❌ Only the server owner can run `/embed`.', ephemeral: true });
+      }
+      const chosenChannel = interaction.options.getChannel('channel');
+      const customId = chosenChannel ? `modal_embed:${chosenChannel.id}` : 'modal_embed';
+      const modal = new ModalBuilder()
+        .setCustomId(customId)
+        .setTitle('Create Embed Announcement')
+        .addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('embed_title')
+              .setLabel('Title (Optional)')
+              .setStyle(TextInputStyle.Short)
+              .setMaxLength(256)
+              .setPlaceholder('e.g. 📢 Server Announcement')
+              .setRequired(false)
+          ),
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('embed_desc')
+              .setLabel('Message / Description')
+              .setStyle(TextInputStyle.Paragraph)
+              .setMaxLength(4000)
+              .setPlaceholder('Write your announcement content here...')
+              .setRequired(true)
+          ),
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('embed_color')
+              .setLabel('Hex Color (Optional, default #5865f2)')
+              .setStyle(TextInputStyle.Short)
+              .setMaxLength(7)
+              .setPlaceholder('#5865f2 or #00ff00')
+              .setRequired(false)
+          ),
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('embed_image')
+              .setLabel('Image / Banner URL (Optional)')
+              .setStyle(TextInputStyle.Short)
+              .setPlaceholder('https://example.com/banner.png')
+              .setRequired(false)
+          ),
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('embed_footer')
+              .setLabel('Footer Text (Optional)')
+              .setStyle(TextInputStyle.Short)
+              .setMaxLength(128)
+              .setPlaceholder('e.g. KINGDOM Official')
+              .setRequired(false)
+          )
+        );
+      return interaction.showModal(modal);
+    }
+
+    // Owner‑only /purge bulk message delete
+    if (interaction.commandName === 'purge') {
+      if (interaction.user.id !== interaction.guild.ownerId) {
+        return interaction.reply({ content: '❌ Only the server owner can run `/purge`.', ephemeral: true });
+      }
+      const amount = interaction.options.getInteger('amount');
+      if (!amount || amount < 1 || amount > 100) {
+        return interaction.reply({ content: '❌ Amount must be between 1 and 100.', ephemeral: true });
+      }
+      await interaction.deferReply({ ephemeral: true });
+      const deleted = await interaction.channel.bulkDelete(amount, true).catch(err => {
+        logger.error(`Purge error: ${err.message}`);
+        return null;
+      });
+      if (!deleted) {
+        return interaction.editReply({ content: '❌ Failed to delete messages (messages older than 14 days cannot be bulk-deleted).' });
+      }
+      return interaction.editReply({ content: `🧹 Successfully deleted **${deleted.size}** message(s) in <#${interaction.channel.id}>!` });
+    }
+
+    // Owner‑only /updatebot (1-click git pull & restart)
+    if (interaction.commandName === 'updatebot') {
+      if (interaction.user.id !== interaction.guild.ownerId) {
+        return interaction.reply({ content: '❌ Only the server owner can run `/updatebot`.', ephemeral: true });
+      }
+      await interaction.deferReply({ ephemeral: true });
+      try {
+        const { stdout, stderr } = await execAsync('git pull origin main');
+        const output = (stdout || stderr || 'Already up to date.').slice(0, 1800);
+        await interaction.editReply({
+          content: `🔄 **Git Pull Complete:**\n\`\`\`\n${output}\n\`\`\`\n♻️ Restarting bot process now...`
+        });
+        setTimeout(() => process.exit(0), 1500);
+        return;
+      } catch (err) {
+        return interaction.editReply({
+          content: `❌ **Git Pull Failed:**\n\`\`\`\n${err.message.slice(0, 1800)}\n\`\`\``
+        });
+      }
+    }
+
+    // Public /vcleaderboard
+    if (interaction.commandName === 'vcleaderboard') {
+      const cfg = await getConfig(interaction.guild.id);
+      const vcStats = { ...(cfg.vcStats || {}) };
+      // Include live ongoing sessions
+      const now = Date.now();
+      for (const [key, startMs] of vcSessionJoinTimes.entries()) {
+        const [gId, uId] = key.split(':');
+        if (gId === interaction.guild.id) {
+          vcStats[uId] = (vcStats[uId] || 0) + Math.floor((now - startMs) / 1000);
+        }
+      }
+      const sorted = Object.entries(vcStats)
+        .filter(([, sec]) => sec > 0)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10);
+
+      if (sorted.length === 0) {
+        return interaction.reply({ content: '📊 No voice channel activity recorded yet!', ephemeral: true });
+      }
+
+      const medals = ['🥇', '🥈', '🥉'];
+      const lines = sorted.map(([uId, sec], idx) => {
+        const badge = medals[idx] || `**#${idx + 1}**`;
+        return `${badge} <@${uId}> — \`${formatDuration(sec)}\``;
+      });
+
+      const embed = new EmbedBuilder()
+        .setTitle(`🏆 ${interaction.guild.name} — Voice Channel Leaderboard`)
+        .setDescription(lines.join('\n'))
+        .setColor(0xf1c40f)
+        .setTimestamp();
+      return interaction.reply({ embeds: [embed] });
+    }
+
+    // Public /vcstats
+    if (interaction.commandName === 'vcstats') {
+      const targetUser = interaction.options.getUser('user') || interaction.user;
+      const cfg = await getConfig(interaction.guild.id);
+      const vcStats = cfg.vcStats || {};
+      let totalSec = vcStats[targetUser.id] || 0;
+      const activeKey = `${interaction.guild.id}:${targetUser.id}`;
+      if (vcSessionJoinTimes.has(activeKey)) {
+        totalSec += Math.floor((Date.now() - vcSessionJoinTimes.get(activeKey)) / 1000);
+      }
+      const embed = new EmbedBuilder()
+        .setTitle('🎙️ Voice Channel Activity')
+        .setDescription(`User: <@${targetUser.id}>\nTotal Time in VCs: **\`${formatDuration(totalSec)}\`**`)
+        .setColor(0x5865f2)
+        .setTimestamp();
+      return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+    // Owner‑only /autorole
+    if (interaction.commandName === 'autorole') {
+      if (interaction.user.id !== interaction.guild.ownerId) {
+        return interaction.reply({ content: '❌ Only the server owner can run `/autorole`.', ephemeral: true });
+      }
+      const role = interaction.options.getRole('role');
+      if (!role) {
+        await setConfig(interaction.guild.id, { autoRoleId: null });
+        return interaction.reply({ content: '🚫 Auto-role on member join has been **disabled**.', ephemeral: true });
+      }
+      await setConfig(interaction.guild.id, { autoRoleId: role.id });
+      return interaction.reply({ content: `✅ Auto-role set! New members joining the server will automatically receive <@&${role.id}>.`, ephemeral: true });
+    }
+
     const targetVc = getTargetVc();
     if (!targetVc) {
       return interaction.reply({ content: '❌ Join your temporary voice channel first before using this command.', ephemeral: true });
     }
 
     const vcData = activeVcs.get(targetVc.id);
+
+    // /claim can be used by any member inside the VC if the current owner is no longer in the VC
+    if (interaction.commandName === 'claim') {
+      const currentOwnerId = vcData?.ownerId;
+      if (currentOwnerId && targetVc.members.has(currentOwnerId) && interaction.user.id !== interaction.guild.ownerId) {
+        return interaction.reply({ content: `❌ The current VC owner (<@${currentOwnerId}>) is still inside this channel!`, ephemeral: true });
+      }
+      if (currentOwnerId) await targetVc.permissionOverwrites.delete(currentOwnerId).catch(() => {});
+      await targetVc.permissionOverwrites.edit(interaction.user.id, { ViewChannel: true, Connect: true, ManageChannels: true });
+      await targetVc.setName(`${interaction.member.displayName}'s VC`).catch(() => {});
+      if (vcData) vcData.ownerId = interaction.user.id;
+      return interaction.reply({ content: `🙋‍♂️ <@${interaction.user.id}> claimed ownership of <#${targetVc.id}>!` });
+    }
     const isServerOwner = interaction.user.id === interaction.guild.ownerId;
     const isOwner = isServerOwner || (vcData
       ? interaction.user.id === vcData.ownerId
@@ -743,8 +1108,42 @@ client.on('interactionCreate', async interaction => {
         const newOwner = await interaction.guild.members.fetch(newOwnerId);
         await targetVc.setName(`${newOwner.displayName}'s VC`).catch(() => {});
         if (vcData) vcData.ownerId = newOwnerId;
-        await targetVc.send({ embeds: [createControlEmbed(newOwnerId, newOwner.displayName)], components: createControlRows() }).catch(() => {});
+        await targetVc.send({ embeds: [createControlEmbed(newOwnerId, newOwner.displayName)], components: createControlRows(Boolean(vcData?.password)) }).catch(() => {});
         return interaction.reply({ content: `👑 Ownership transferred to <@${newOwnerId}>.`, ephemeral: true });
+      }
+      case 'rename': {
+        const newName = interaction.options.getString('name').trim();
+        await targetVc.setName(newName);
+        return interaction.reply({ content: `✏️ Voice channel renamed to **${newName}**!`, ephemeral: true });
+      }
+      case 'hide': {
+        const everyoneOverwrite = targetVc.permissionOverwrites.cache.get(interaction.guildId);
+        const currentlyHidden = everyoneOverwrite?.deny.has(PermissionFlagsBits.ViewChannel);
+        await targetVc.permissionOverwrites.edit(interaction.guildId, {
+          ViewChannel: currentlyHidden ? null : false
+        });
+        return interaction.reply({
+          content: currentlyHidden
+            ? `👁️ <#${targetVc.id}> is now **visible** to the server.`
+            : `👻 <#${targetVc.id}> is now **hidden (Ghost Mode)**!`,
+          ephemeral: true
+        });
+      }
+      case 'muteall': {
+        const otherMembers = Array.from(targetVc.members.values()).filter(m => m.id !== interaction.user.id);
+        if (otherMembers.length === 0) {
+          return interaction.reply({ content: 'ℹ️ No other members inside this VC to mute/unmute.', ephemeral: true });
+        }
+        const anyUnmuted = otherMembers.some(m => !m.voice.serverMute);
+        for (const m of otherMembers) {
+          await m.voice.setMute(anyUnmuted).catch(() => {});
+        }
+        return interaction.reply({
+          content: anyUnmuted
+            ? `🔇 **Muted all** other members in <#${targetVc.id}>!`
+            : `🔊 **Unmuted all** members in <#${targetVc.id}>!`,
+          ephemeral: true
+        });
       }
     }
   }
@@ -778,6 +1177,85 @@ client.on('interactionCreate', async interaction => {
       return interaction.showModal(modal);
     }
 
+    // Anyone can click "🔔 Request to Join" (Knock) on a locked VC
+    if (interaction.customId === 'knock_vc') {
+      const targetVc = interaction.channel?.isVoiceBased?.() ? interaction.channel : getTargetVc();
+      if (!targetVc) {
+        return interaction.reply({ content: '❌ Open the voice channel chat to click this button.', ephemeral: true });
+      }
+      const vcData = activeVcs.get(targetVc.id);
+      const ownerId = vcData?.ownerId || interaction.guild.ownerId;
+      const knockRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`knock_accept:${targetVc.id}:${interaction.user.id}`)
+          .setLabel('Accept & Allow')
+          .setStyle(ButtonStyle.Success)
+          .setEmoji('✅'),
+        new ButtonBuilder()
+          .setCustomId(`knock_deny:${targetVc.id}:${interaction.user.id}`)
+          .setLabel('Deny')
+          .setStyle(ButtonStyle.Danger)
+          .setEmoji('✖️')
+      );
+      await targetVc.send({
+        content: `🔔 <@${ownerId}>, **<@${interaction.user.id}>** is knocking and requesting to join <#${targetVc.id}>!`,
+        components: [knockRow]
+      }).catch(() => {});
+      return interaction.reply({ content: `🔔 Knock sent! Waiting for the VC owner to accept your request.`, ephemeral: true });
+    }
+
+    // Handle Knock Accept / Deny buttons (VC owner or Server Owner)
+    if (interaction.customId.startsWith('knock_accept:') || interaction.customId.startsWith('knock_deny:')) {
+      const [actionType, vcId, requesterId] = interaction.customId.split(':');
+      const targetVc = interaction.guild.channels.cache.get(vcId) || getTargetVc();
+      if (!targetVc) {
+        return interaction.reply({ content: '❌ Voice channel no longer exists.', ephemeral: true });
+      }
+      const vcData = activeVcs.get(targetVc.id);
+      const isServerOwner = interaction.user.id === interaction.guild.ownerId;
+      const isOwner = isServerOwner || (vcData ? interaction.user.id === vcData.ownerId : targetVc.permissionsFor(interaction.member)?.has(PermissionFlagsBits.ManageChannels));
+      if (!isOwner) {
+        return interaction.reply({ content: '❌ Only the VC owner or server owner can accept/deny join requests.', ephemeral: true });
+      }
+      if (actionType === 'knock_accept') {
+        await targetVc.permissionOverwrites.edit(requesterId, {
+          ViewChannel: true,
+          Connect: true
+        }).catch(() => {});
+        const reqMember = await interaction.guild.members.fetch(requesterId).catch(() => null);
+        if (reqMember?.voice?.channelId && reqMember.voice.channelId !== targetVc.id) {
+          await reqMember.voice.setChannel(targetVc).catch(() => {});
+        }
+        return interaction.update({
+          content: `✅ Allowed <@${requesterId}> to join <#${targetVc.id}>!`,
+          components: []
+        });
+      } else {
+        return interaction.update({
+          content: `🚫 Denied join request from <@${requesterId}>.`,
+          components: []
+        });
+      }
+    }
+
+    // Anyone inside the VC can click "🙋‍♂️ Claim VC" if the owner left
+    if (interaction.customId === 'claim_vc') {
+      const targetVc = getTargetVc();
+      if (!targetVc) {
+        return interaction.reply({ content: '❌ Join the voice channel first to claim it.', ephemeral: true });
+      }
+      const vcData = activeVcs.get(targetVc.id);
+      const currentOwnerId = vcData?.ownerId;
+      if (currentOwnerId && targetVc.members.has(currentOwnerId) && interaction.user.id !== interaction.guild.ownerId) {
+        return interaction.reply({ content: `❌ The current VC owner (<@${currentOwnerId}>) is still inside this channel!`, ephemeral: true });
+      }
+      if (currentOwnerId) await targetVc.permissionOverwrites.delete(currentOwnerId).catch(() => {});
+      await targetVc.permissionOverwrites.edit(interaction.user.id, { ViewChannel: true, Connect: true, ManageChannels: true });
+      await targetVc.setName(`${interaction.member.displayName}'s VC`).catch(() => {});
+      if (vcData) vcData.ownerId = interaction.user.id;
+      return interaction.reply({ content: `🙋‍♂️ <@${interaction.user.id}> claimed ownership of <#${targetVc.id}>!` });
+    }
+
     const targetVc = getTargetVc();
     if (!targetVc) {
       return interaction.reply({ content: '❌ Join the voice channel first to use these controls.', ephemeral: true });
@@ -800,10 +1278,11 @@ client.on('interactionCreate', async interaction => {
             Connect: null
           });
           if (vcData) vcData.password = null;
+          const isHidden = Boolean(targetVc.permissionOverwrites.cache.get(interaction.guildId)?.deny.has(PermissionFlagsBits.ViewChannel));
           const ownerMember = await interaction.guild.members.fetch(vcData?.ownerId || interaction.user.id).catch(() => interaction.member);
-          const updatedEmbed = createControlEmbed(vcData?.ownerId || interaction.user.id, ownerMember?.displayName || 'Owner', false, false);
+          const updatedEmbed = createControlEmbed(vcData?.ownerId || interaction.user.id, ownerMember?.displayName || 'Owner', false, false, isHidden);
           if (interaction.message) {
-            await interaction.message.edit({ embeds: [updatedEmbed], components: createControlRows(false) }).catch(() => {});
+            await interaction.message.edit({ embeds: [updatedEmbed], components: createControlRows(false, false) }).catch(() => {});
           }
           return interaction.reply({ content: `🔓 <#${targetVc.id}> unlocked (password cleared).`, ephemeral: true });
         }
@@ -832,6 +1311,58 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({
           content: '✅ **Select users to whitelist (allow access even when locked):**\n*(Use the search bar or check multiple users below)*',
           components: [new ActionRowBuilder().addComponents(userSelect)],
+          ephemeral: true
+        });
+      }
+      case 'rename_vc': {
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_rename:${targetVc.id}`)
+          .setTitle('Rename Voice Channel')
+          .addComponents(
+            new ActionRowBuilder().addComponents(
+              new TextInputBuilder()
+                .setCustomId('rename_input')
+                .setLabel('New Channel Name')
+                .setStyle(TextInputStyle.Short)
+                .setMaxLength(90)
+                .setPlaceholder(`e.g. Valorant 5-Stack`)
+                .setRequired(true)
+            )
+          );
+        return interaction.showModal(modal);
+      }
+      case 'hide_vc': {
+        const everyoneOverwrite = targetVc.permissionOverwrites.cache.get(interaction.guildId);
+        const currentlyHidden = everyoneOverwrite?.deny.has(PermissionFlagsBits.ViewChannel);
+        const currentlyLocked = Boolean(everyoneOverwrite?.deny.has(PermissionFlagsBits.Connect));
+        await targetVc.permissionOverwrites.edit(interaction.guildId, {
+          ViewChannel: currentlyHidden ? null : false
+        });
+        const ownerMember = await interaction.guild.members.fetch(vcData?.ownerId || interaction.user.id).catch(() => interaction.member);
+        const updatedEmbed = createControlEmbed(vcData?.ownerId || interaction.user.id, ownerMember?.displayName || 'Owner', currentlyLocked, Boolean(vcData?.password), !currentlyHidden);
+        if (interaction.message) {
+          await interaction.message.edit({ embeds: [updatedEmbed], components: createControlRows(Boolean(vcData?.password), currentlyLocked) }).catch(() => {});
+        }
+        return interaction.reply({
+          content: currentlyHidden
+            ? `👁️ <#${targetVc.id}> is now **visible** to the server.`
+            : `👻 <#${targetVc.id}> is now **hidden (Ghost Mode)**!`,
+          ephemeral: true
+        });
+      }
+      case 'mute_all': {
+        const otherMembers = Array.from(targetVc.members.values()).filter(m => m.id !== interaction.user.id);
+        if (otherMembers.length === 0) {
+          return interaction.reply({ content: 'ℹ️ No other members inside this VC to mute/unmute.', ephemeral: true });
+        }
+        const anyUnmuted = otherMembers.some(m => !m.voice.serverMute);
+        for (const m of otherMembers) {
+          await m.voice.setMute(anyUnmuted).catch(() => {});
+        }
+        return interaction.reply({
+          content: anyUnmuted
+            ? `🔇 **Muted all** other members in <#${targetVc.id}>!`
+            : `🔊 **Unmuted all** members in <#${targetVc.id}>!`,
           ephemeral: true
         });
       }

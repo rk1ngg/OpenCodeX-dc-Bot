@@ -381,13 +381,15 @@ const spamTracker = new Map();
 // -------------------------------------------------
 // Ready & Guild Join events
 // -------------------------------------------------
+let initialReadyDone = false;
+
 client.once('ready', async () => {
   logger.info(`✅ Bot logged in as ${client.user.tag}`);
 
   for (const guild of client.guilds.cache.values()) {
     await registerGuildCommands(guild);
     try {
-      await ensureOpenCodeXChannel(guild);
+      const openChannel = await ensureOpenCodeXChannel(guild);
 
       const cfg = await getConfig(guild.id);
       if (cfg.setupCategoryName) {
@@ -426,8 +428,42 @@ client.once('ready', async () => {
           await guild.channels.create({ name: TEMP_VC_NAME, type: ChannelType.GuildVoice, parent: category.id });
         }
       }
+
+      // Send "Bot Connected / Restarted" notification to #opencodex
+      if (openChannel) {
+        const onlineEmbed = new EmbedBuilder()
+          .setTitle('🟢 Bot Connected & Online!')
+          .setDescription(
+            `**${client.user.tag}** is now online and ready.\n` +
+            `• **Status:** Connected (${time(new Date(), 'R')})\n` +
+            `• **Default \`/channelmsg\` Target:** ${cfg.consoleChannelId ? `<#${cfg.consoleChannelId}>` : '*Not set*'}`
+          )
+          .setColor(0x2ecc71)
+          .setTimestamp();
+        await openChannel.send({ embeds: [onlineEmbed] }).catch(() => {});
+      }
     } catch (err) {
       logger.error(`Setup error in guild ${guild.name}: ${err}`);
+    }
+  }
+
+  initialReadyDone = true;
+});
+
+// Notify #opencodex if the bot disconnects and reconnects to Discord gateway
+client.on('shardReady', async () => {
+  if (!initialReadyDone) return;
+  for (const guild of client.guilds.cache.values()) {
+    const openChannel = guild.channels.cache.find(
+      c => c.type === ChannelType.GuildText && c.name.toLowerCase() === OPEN_CODEX_CHANNEL_NAME
+    );
+    if (openChannel) {
+      const reconEmbed = new EmbedBuilder()
+        .setTitle('🟢 Bot Reconnected!')
+        .setDescription(`**${client.user.tag}** re-established connection to Discord (${time(new Date(), 'R')}).`)
+        .setColor(0x2ecc71)
+        .setTimestamp();
+      await openChannel.send({ embeds: [reconEmbed] }).catch(() => {});
     }
   }
 });
@@ -2045,15 +2081,31 @@ rl.on('line', async line => {
 });
 
 // -------------------------------------------------
-// Graceful shutdown – delete any orphaned temp VCs
+// Graceful shutdown – notify #opencodex & delete any orphaned temp VCs
 // -------------------------------------------------
-process.on('SIGINT', async () => {
-  logger.info('🛑 Shutting down, cleaning up temp VCs...');
+async function handleShutdown(signal) {
+  logger.info(`🛑 Received ${signal}, shutting down and cleaning up temp VCs...`);
+  for (const guild of client.guilds.cache.values()) {
+    const openChannel = guild.channels.cache.find(
+      c => c.type === ChannelType.GuildText && c.name.toLowerCase() === OPEN_CODEX_CHANNEL_NAME
+    );
+    if (openChannel) {
+      const offEmbed = new EmbedBuilder()
+        .setTitle('🔴 Bot Disconnecting / Restarting...')
+        .setDescription(`**${client.user?.tag || 'Bot'}** is shutting down or restarting (${time(new Date(), 'R')}).`)
+        .setColor(0xe74c3c)
+        .setTimestamp();
+      await openChannel.send({ embeds: [offEmbed] }).catch(() => {});
+    }
+  }
   for (const [vcId] of activeVcs) {
     const channel = client.channels.cache.get(vcId);
     if (channel) await channel.delete().catch(() => {});
   }
   process.exit(0);
-});
+}
+
+process.on('SIGINT', () => handleShutdown('SIGINT'));
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 
 client.login(TOKEN);

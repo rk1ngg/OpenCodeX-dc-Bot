@@ -399,6 +399,7 @@ async function ensureOpenCodeXChannel(guild, parentCategoryId = null) {
 const activeVcs = new Map(); // vcId -> {ownerId, creatorId, startTime, members:Set}
 const moveChannelState = new Map(); // userId -> { channelToMoveId, afterChannelId }
 const vcSessionJoinTimes = new Map(); // `${guildId}:${userId}` -> timestamp ms
+const pendingKnocks = new Map(); // `${vcId}:${requesterId}` -> ButtonInteraction (ephemeral)
 
 function formatDuration(totalSeconds) {
   const hrs = Math.floor(totalSeconds / 3600);
@@ -1553,8 +1554,11 @@ client.on('interactionCreate', async interaction => {
         content: `🔔 <@${ownerId}>, **<@${interaction.user.id}>** is requesting to join <#${targetVc.id}>!`,
         components: [knockRow]
       }).catch(() => {});
+
+      pendingKnocks.set(`${targetVc.id}:${interaction.user.id}`, interaction);
+
       return interaction.reply({
-        content: `🔔 Join request sent to <@${ownerId}> in <#${targetVc.id}>'s Open Chat!`,
+        content: `🔔 **Knock sent!** Waiting for the VC owner (<@${ownerId}>) to accept your request...`,
         ephemeral: true
       });
     }
@@ -1572,6 +1576,10 @@ client.on('interactionCreate', async interaction => {
       if (!isOwner) {
         return interaction.reply({ content: '❌ Only the VC owner or server owner can accept/deny join requests.', ephemeral: true });
       }
+      const knockKey = `${targetVc.id}:${requesterId}`;
+      const requesterInteraction = pendingKnocks.get(knockKey);
+      pendingKnocks.delete(knockKey);
+
       if (actionType === 'knock_accept') {
         if (vcData) {
           if (!vcData.allowedUsers) vcData.allowedUsers = new Set();
@@ -1582,17 +1590,24 @@ client.on('interactionCreate', async interaction => {
           Connect: true
         }).catch(() => {});
         const reqMember = await interaction.guild.members.fetch(requesterId).catch(() => null);
-        if (reqMember) {
-          if (reqMember.voice?.channelId && reqMember.voice.channelId !== targetVc.id) {
-            await reqMember.voice.setChannel(targetVc).catch(() => {});
-          }
-          await reqMember.send(`✅ <@${interaction.user.id}> accepted your request! You can now join <#${targetVc.id}>.`).catch(() => {});
+        if (reqMember?.voice?.channelId && reqMember.voice.channelId !== targetVc.id) {
+          await reqMember.voice.setChannel(targetVc).catch(() => {});
+        }
+        if (requesterInteraction) {
+          await requesterInteraction.editReply({
+            content: `✅ **Request accepted!** <@${interaction.user.id}> allowed you to join <#${targetVc.id}> — click the voice channel to hop in!`
+          }).catch(() => {});
         }
         return interaction.update({
           content: `✅ Allowed <@${requesterId}> to join <#${targetVc.id}>!`,
           components: []
         });
       } else {
+        if (requesterInteraction) {
+          await requesterInteraction.editReply({
+            content: `🚫 **Request denied.** <@${interaction.user.id}> declined your request to join <#${targetVc.id}>.`
+          }).catch(() => {});
+        }
         return interaction.update({
           content: `🚫 Denied join request from <@${requesterId}>.`,
           components: []

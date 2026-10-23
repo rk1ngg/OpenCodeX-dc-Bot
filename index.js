@@ -326,27 +326,52 @@ function formatDuration(totalSeconds) {
   return `${secs}s`;
 }
 
-// Helper: Wipe all recent messages from a compromised/virus user across EVERY text channel in the guild
+// Helper: Wipe all recent messages from a compromised/virus user across EVERY text-based channel in the guild
 async function wipeUserMessagesAcrossGuild(guild, userId, action = 'timeout') {
   let totalDeleted = 0;
   let channelsCleaned = 0;
-  const textChannels = guild.channels.cache.filter(
-    c => c.type === ChannelType.GuildText || c.type === ChannelType.GuildAnnouncement
-  );
+
+  await guild.channels.fetch().catch(() => {});
+  const textChannels = guild.channels.cache.filter(c => c && typeof c.isTextBased === 'function' && c.isTextBased());
 
   for (const channel of textChannels.values()) {
     try {
       const messages = await channel.messages.fetch({ limit: 100 }).catch(() => null);
       if (!messages) continue;
-      const userMsgs = messages.filter(
-        m => m.author.id === userId && (Date.now() - m.createdTimestamp) < 14 * 24 * 60 * 60 * 1000
-      );
-      if (userMsgs.size > 0) {
-        const deleted = await channel.bulkDelete(userMsgs, true).catch(() => null);
-        if (deleted && deleted.size > 0) {
-          totalDeleted += deleted.size;
-          channelsCleaned++;
+
+      const userMsgs = messages.filter(m => m.author?.id === userId);
+      if (userMsgs.size === 0) continue;
+
+      let deletedInChannel = 0;
+      const twoWeeksMs = 14 * 24 * 60 * 60 * 1000;
+      const bulkEligible = userMsgs.filter(m => (Date.now() - m.createdTimestamp) < twoWeeksMs);
+      const olderMsgs = userMsgs.filter(m => (Date.now() - m.createdTimestamp) >= twoWeeksMs);
+
+      if (bulkEligible.size >= 2) {
+        const deleted = await channel.bulkDelete(bulkEligible, true).catch(() => null);
+        if (deleted) {
+          deletedInChannel += deleted.size;
+        } else {
+          // Fallback to single delete if bulkDelete fails
+          for (const msg of bulkEligible.values()) {
+            const ok = await msg.delete().then(() => true).catch(() => false);
+            if (ok) deletedInChannel++;
+          }
         }
+      } else if (bulkEligible.size === 1) {
+        const singleMsg = bulkEligible.first();
+        const ok = await singleMsg.delete().then(() => true).catch(() => false);
+        if (ok) deletedInChannel++;
+      }
+
+      for (const msg of olderMsgs.values()) {
+        const ok = await msg.delete().then(() => true).catch(() => false);
+        if (ok) deletedInChannel++;
+      }
+
+      if (deletedInChannel > 0) {
+        totalDeleted += deletedInChannel;
+        channelsCleaned++;
       }
     } catch (_) {}
   }
@@ -354,20 +379,38 @@ async function wipeUserMessagesAcrossGuild(guild, userId, action = 'timeout') {
   let actionResult = 'None (messages deleted only)';
   if (action !== 'none') {
     const member = await guild.members.fetch(userId).catch(() => null);
-    if (member && member.id !== guild.ownerId) {
+    if (!member) {
+      actionResult = 'User is no longer in the server';
+    } else if (member.id === guild.ownerId) {
+      actionResult = 'Skipped (User is Server Owner)';
+    } else {
       try {
         if (action === 'timeout') {
-          await member.timeout(24 * 60 * 60 * 1000, 'OpenCodeX Anti-Virus / Cross-Channel Spam Cleanup');
-          actionResult = 'Timed out for 24 hours';
+          if (member.permissions.has(PermissionFlagsBits.Administrator)) {
+            actionResult = '⚠️ Cannot timeout an Administrator (Discord limitation)';
+          } else if (!member.moderatable) {
+            actionResult = '⚠️ Bot role is below this user’s role (Move the Bot role higher in Server Settings → Roles)';
+          } else {
+            await member.timeout(24 * 60 * 60 * 1000, 'OpenCodeX Anti-Virus / Cross-Channel Spam Cleanup');
+            actionResult = '⏳ Timed out for 24 hours';
+          }
         } else if (action === 'kick') {
-          await member.kick('OpenCodeX Anti-Virus / Cross-Channel Spam Cleanup');
-          actionResult = 'Kicked from server';
+          if (!member.kickable) {
+            actionResult = '⚠️ Bot role is below this user’s role (Move the Bot role higher in Server Settings → Roles)';
+          } else {
+            await member.kick('OpenCodeX Anti-Virus / Cross-Channel Spam Cleanup');
+            actionResult = '👢 Kicked from server';
+          }
         } else if (action === 'ban') {
-          await member.ban({ reason: 'OpenCodeX Anti-Virus / Cross-Channel Spam Cleanup' });
-          actionResult = 'Banned from server';
+          if (!member.bannable) {
+            actionResult = '⚠️ Bot role is below this user’s role (Move the Bot role higher in Server Settings → Roles)';
+          } else {
+            await member.ban({ deleteMessageSeconds: 7 * 24 * 60 * 60, reason: 'OpenCodeX Anti-Virus / Cross-Channel Spam Cleanup' });
+            actionResult = '🔨 Banned from server (and wiped 7 days of messages)';
+          }
         }
       } catch (err) {
-        actionResult = `Failed to ${action}: ${err.message}`;
+        actionResult = `⚠️ Failed to ${action}: ${err.message} (Check Bot Role position & permissions)`;
       }
     }
   }

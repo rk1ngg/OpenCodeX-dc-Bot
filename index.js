@@ -42,7 +42,9 @@ if (!TOKEN) {
 // ----- Configuration constants -----
 const OPEN_CODEX_CHANNEL_NAME = 'opencodex';
 const TEMP_VC_NAME = 'Join to Create VCs';
-const TEMP_TEXT_CHANNEL_NAME = 'bot-logs';
+const TEMP_TEXT_CHANNEL_NAME = 'session-logs';
+const LEGACY_LOG_CHANNEL_NAME = 'bot-logs';
+const WAITING_ROOM_VC_NAME = '🔐 Waiting Room (Enter Password)';
 const DEFAULT_CATEGORY_NAME = "Summoner’s Hall";
 const GUILD_COMMANDS = true; // set false for global registration (may take 1h)
 
@@ -214,6 +216,30 @@ const commands = [
         required: false
       }
     ]
+  },
+  {
+    name: 'cleanvirus',
+    description: 'Wipe spam/virus messages from a user across ALL channels in 1 click (owner only)',
+    options: [
+      {
+        name: 'user',
+        type: 6, // USER
+        description: 'The compromised/spamming user whose messages will be wiped across all channels',
+        required: true
+      },
+      {
+        name: 'action',
+        type: 3, // STRING
+        description: 'Optional punishment to stop the spammer immediately',
+        required: false,
+        choices: [
+          { name: 'Timeout for 24 Hours (Recommended)', value: 'timeout' },
+          { name: 'Kick from Server', value: 'kick' },
+          { name: 'Ban from Server', value: 'ban' },
+          { name: 'Delete Messages Only', value: 'none' }
+        ]
+      }
+    ]
   }
 ];
 
@@ -300,6 +326,58 @@ function formatDuration(totalSeconds) {
   return `${secs}s`;
 }
 
+// Helper: Wipe all recent messages from a compromised/virus user across EVERY text channel in the guild
+async function wipeUserMessagesAcrossGuild(guild, userId, action = 'timeout') {
+  let totalDeleted = 0;
+  let channelsCleaned = 0;
+  const textChannels = guild.channels.cache.filter(
+    c => c.type === ChannelType.GuildText || c.type === ChannelType.GuildAnnouncement
+  );
+
+  for (const channel of textChannels.values()) {
+    try {
+      const messages = await channel.messages.fetch({ limit: 100 }).catch(() => null);
+      if (!messages) continue;
+      const userMsgs = messages.filter(
+        m => m.author.id === userId && (Date.now() - m.createdTimestamp) < 14 * 24 * 60 * 60 * 1000
+      );
+      if (userMsgs.size > 0) {
+        const deleted = await channel.bulkDelete(userMsgs, true).catch(() => null);
+        if (deleted && deleted.size > 0) {
+          totalDeleted += deleted.size;
+          channelsCleaned++;
+        }
+      }
+    } catch (_) {}
+  }
+
+  let actionResult = 'None (messages deleted only)';
+  if (action !== 'none') {
+    const member = await guild.members.fetch(userId).catch(() => null);
+    if (member && member.id !== guild.ownerId) {
+      try {
+        if (action === 'timeout') {
+          await member.timeout(24 * 60 * 60 * 1000, 'OpenCodeX Anti-Virus / Cross-Channel Spam Cleanup');
+          actionResult = 'Timed out for 24 hours';
+        } else if (action === 'kick') {
+          await member.kick('OpenCodeX Anti-Virus / Cross-Channel Spam Cleanup');
+          actionResult = 'Kicked from server';
+        } else if (action === 'ban') {
+          await member.ban({ reason: 'OpenCodeX Anti-Virus / Cross-Channel Spam Cleanup' });
+          actionResult = 'Banned from server';
+        }
+      } catch (err) {
+        actionResult = `Failed to ${action}: ${err.message}`;
+      }
+    }
+  }
+
+  return { totalDeleted, channelsCleaned, actionResult };
+}
+
+// Track cross-channel spam (userId -> { text, channels: Set, firstTimestamp })
+const spamTracker = new Map();
+
 // -------------------------------------------------
 // Ready & Guild Join events
 // -------------------------------------------------
@@ -321,13 +399,13 @@ client.once('ready', async () => {
         }
 
         let logChannel = guild.channels.cache.find(
-          c => c.type === ChannelType.GuildText && c.name === TEMP_TEXT_CHANNEL_NAME && c.parentId === category.id
+          c => c.type === ChannelType.GuildText && (c.name === TEMP_TEXT_CHANNEL_NAME || c.name === LEGACY_LOG_CHANNEL_NAME) && c.parentId === category.id
         ) || guild.channels.cache.find(
-          c => c.type === ChannelType.GuildText && c.name === TEMP_TEXT_CHANNEL_NAME
+          c => c.type === ChannelType.GuildText && (c.name === TEMP_TEXT_CHANNEL_NAME || c.name === LEGACY_LOG_CHANNEL_NAME)
         );
         if (!logChannel) {
           logChannel = await guild.channels.create({
-            name: TEMP_TEXT_CHANNEL_NAME,
+            name: 'Session-logs',
             type: ChannelType.GuildText,
             parent: category.id,
             permissionOverwrites: [
@@ -335,6 +413,8 @@ client.once('ready', async () => {
               { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks, PermissionFlagsBits.AttachFiles] }
             ]
           });
+        } else if (logChannel.name === LEGACY_LOG_CHANNEL_NAME) {
+          await logChannel.setName('Session-logs').catch(() => {});
         }
 
         let genVc = guild.channels.cache.find(
@@ -403,10 +483,67 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
       }
     }
   }
-  // Track members in active VCs
+  // Track members in active VCs & intercept unauthorized joins on password-protected VCs
   if (newState.channelId && activeVcs.has(newState.channelId)) {
     const data = activeVcs.get(newState.channelId);
-    data.members.add(newState.member.displayName);
+    const member = newState.member;
+    const guild = newState.guild;
+
+    // Check if this VC has a password and the joining user is not authorized yet
+    const isAuthorized =
+      member.id === data.ownerId ||
+      member.id === guild.ownerId ||
+      data.allowedUsers?.has(member.id) ||
+      newState.channel.permissionOverwrites.cache.get(member.id)?.allow.has(PermissionFlagsBits.Connect);
+
+    if (data.password && !isAuthorized && !member.user.bot) {
+      // Create or find a Waiting Room VC to hold the user while they enter the password
+      let waitingVc = guild.channels.cache.find(
+        c => c.type === ChannelType.GuildVoice && c.name === WAITING_ROOM_VC_NAME && c.parentId === newState.channel.parentId
+      );
+      if (!waitingVc) {
+        waitingVc = await guild.channels.create({
+          name: WAITING_ROOM_VC_NAME,
+          type: ChannelType.GuildVoice,
+          parent: newState.channel.parentId,
+          permissionOverwrites: [
+            { id: guild.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect], deny: [PermissionFlagsBits.Speak] },
+            { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.SendMessages, PermissionFlagsBits.MoveMembers] }
+          ]
+        }).catch(() => null);
+      }
+
+      if (waitingVc) {
+        await member.voice.setChannel(waitingVc).catch(() => {});
+      } else {
+        await member.voice.disconnect().catch(() => {});
+      }
+
+      const passRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`enter_password:${newState.channelId}`)
+          .setLabel(`Enter Password for ${newState.channel.name}`)
+          .setStyle(ButtonStyle.Primary)
+          .setEmoji('🔑')
+      );
+
+      const promptEmbed = new EmbedBuilder()
+        .setTitle(`🔐 Password Required — ${newState.channel.name}`)
+        .setDescription(
+          `Hey <@${member.id}>! **${newState.channel.name}** is protected with a password.\n\n` +
+          `Click the **🔑 Enter Password** button below and type the password to get pulled into the voice channel automatically!`
+        )
+        .setColor(0xf1c40f);
+
+      if (waitingVc) {
+        await waitingVc.send({ content: `<@${member.id}>`, embeds: [promptEmbed], components: [passRow] }).catch(() => {});
+      }
+      await newState.channel.send({ content: `<@${member.id}>`, embeds: [promptEmbed], components: [passRow] }).catch(() => {});
+      await member.send({ embeds: [promptEmbed], components: [passRow] }).catch(() => {});
+      return;
+    }
+
+    data.members.add(member.displayName);
   }
 
   // User joins the generator channel
@@ -451,6 +588,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
       startTime: new Date(),
       members: new Set([displayName]),
       password: null,
+      allowedUsers: new Set([member.id]),
       panelMessageId: panelMsg?.id || null
     });
   }
@@ -485,8 +623,15 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         logEmbed.addFields({ name: 'Created by', value: ownerLine });
       }
 
-      const logChannel = oldState.guild.channels.cache.find(c => c.type === ChannelType.GuildText && c.name === TEMP_TEXT_CHANNEL_NAME);
+      const logChannel = oldState.guild.channels.cache.find(
+        c => c.type === ChannelType.GuildText && (c.name === TEMP_TEXT_CHANNEL_NAME || c.name === LEGACY_LOG_CHANNEL_NAME)
+      );
       if (logChannel) await logChannel.send({ embeds: [logEmbed] }).catch(() => {});
+      await leftChannel.delete().catch(() => {});
+    }
+
+    // Also auto-delete the Waiting Room VC when it becomes empty
+    if (leftChannel.name === WAITING_ROOM_VC_NAME && leftChannel.members.size === 0) {
       await leftChannel.delete().catch(() => {});
     }
   }
@@ -497,6 +642,80 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 // -------------------------------------------------
 client.on('interactionCreate', async interaction => {
   try {
+  // Handle "🔑 Enter Password" button (works in VC chat, Waiting Room, OR Direct Messages)
+  if (interaction.isButton() && (interaction.customId === 'enter_password' || interaction.customId.startsWith('enter_password:'))) {
+    const explicitVcId = interaction.customId.includes(':') ? interaction.customId.split(':')[1] : null;
+    let targetVc = null;
+    if (explicitVcId) {
+      targetVc = client.channels.cache.get(explicitVcId) || await client.channels.fetch(explicitVcId).catch(() => null);
+    } else if (interaction.channel?.isVoiceBased?.()) {
+      targetVc = interaction.channel;
+    } else if (interaction.member?.voice?.channel) {
+      targetVc = interaction.member.voice.channel;
+    }
+    if (!targetVc) {
+      return interaction.reply({ content: '❌ Voice channel no longer exists.', ephemeral: true });
+    }
+    const vcData = activeVcs.get(targetVc.id);
+    if (!vcData || !vcData.password) {
+      return interaction.reply({ content: 'ℹ️ This voice channel does not require a password right now.', ephemeral: true });
+    }
+    const modal = new ModalBuilder()
+      .setCustomId(`modal_enter_password:${targetVc.id}`)
+      .setTitle(`Enter Password for ${targetVc.name.slice(0, 25)}`)
+      .addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('password_attempt')
+            .setLabel('Voice Channel Password')
+            .setStyle(TextInputStyle.Short)
+            .setMaxLength(32)
+            .setPlaceholder('Enter the password...')
+            .setRequired(true)
+        )
+      );
+    return interaction.showModal(modal);
+  }
+
+  // Modal submit for entering VC password (works in Guild or Direct Messages)
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_enter_password')) {
+    const explicitId = interaction.customId.split(':')[1];
+    const targetVc = (explicitId && (client.channels.cache.get(explicitId) || await client.channels.fetch(explicitId).catch(() => null))) ||
+      (interaction.channel?.isVoiceBased?.() ? interaction.channel : null);
+    if (!targetVc) {
+      return interaction.reply({ content: '❌ Voice channel not found.', ephemeral: true });
+    }
+    const vcData = activeVcs.get(targetVc.id);
+    if (!vcData || !vcData.password) {
+      return interaction.reply({ content: 'ℹ️ This voice channel does not have an active password.', ephemeral: true });
+    }
+    const attempt = interaction.fields.getTextInputValue('password_attempt').trim();
+    if (attempt !== vcData.password) {
+      return interaction.reply({ content: '❌ **Incorrect password!** Access denied.', ephemeral: true });
+    }
+
+    if (!vcData.allowedUsers) vcData.allowedUsers = new Set();
+    vcData.allowedUsers.add(interaction.user.id);
+
+    await targetVc.permissionOverwrites.edit(interaction.user.id, {
+      ViewChannel: true,
+      Connect: true
+    }).catch(() => {});
+
+    // Fetch member in that guild and move them from Waiting Room (or any VC) into targetVc automatically!
+    const guildMember = interaction.member?.voice
+      ? interaction.member
+      : await targetVc.guild.members.fetch(interaction.user.id).catch(() => null);
+    if (guildMember?.voice?.channelId && guildMember.voice.channelId !== targetVc.id) {
+      await guildMember.voice.setChannel(targetVc).catch(() => {});
+    }
+
+    return interaction.reply({
+      content: `✅ **Password accepted!** You have been moved into <#${targetVc.id}>.`,
+      ephemeral: true
+    });
+  }
+
   if (!interaction.inGuild()) return;
 
   // Helper to resolve the user's target Voice Channel (works even if command is used in another chat or if channel is uncached)
@@ -535,8 +754,10 @@ client.on('interactionCreate', async interaction => {
     const rawPassword = interaction.fields.getTextInputValue('password_input').trim();
     const hasPassword = rawPassword.length > 0;
 
+    // If password is set, keep Connect: true on @everyone so clicking the VC triggers voiceStateUpdate
+    // which immediately intercepts the user into the Waiting Room and sends them the password prompt!
     await targetVc.permissionOverwrites.edit(interaction.guildId, {
-      Connect: false
+      Connect: hasPassword ? true : false
     });
 
     let vcData = activeVcs.get(targetVc.id);
@@ -547,10 +768,12 @@ client.on('interactionCreate', async interaction => {
         startTime: new Date(),
         members: new Set(),
         password: null,
+        allowedUsers: new Set([interaction.user.id]),
         panelMessageId: null
       };
       activeVcs.set(targetVc.id, vcData);
     }
+    if (!vcData.allowedUsers) vcData.allowedUsers = new Set([vcData.ownerId]);
     vcData.password = hasPassword ? rawPassword : null;
 
     // Refresh control panel so the "🔑 Enter Password" and "🔔 Request to Join" buttons appear
@@ -570,39 +793,6 @@ client.on('interactionCreate', async interaction => {
       content: hasPassword
         ? `🔐 <#${targetVc.id}> is now **locked with password** (\`${rawPassword}\`). Users can click **🔑 Enter Password** to unlock access!`
         : `🔒 <#${targetVc.id}> is now **private** (no password).`,
-      ephemeral: true
-    });
-  }
-
-  // Modal submit for entering VC password
-  if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_enter_password')) {
-    const explicitId = interaction.customId.split(':')[1];
-    const targetVc = (explicitId && interaction.guild.channels.cache.get(explicitId)) ||
-      (interaction.channel?.isVoiceBased?.() ? interaction.channel : null);
-    if (!targetVc) {
-      return interaction.reply({ content: '❌ Voice channel not found.', ephemeral: true });
-    }
-    const vcData = activeVcs.get(targetVc.id);
-    if (!vcData || !vcData.password) {
-      return interaction.reply({ content: 'ℹ️ This voice channel does not have an active password.', ephemeral: true });
-    }
-    const attempt = interaction.fields.getTextInputValue('password_attempt').trim();
-    if (attempt !== vcData.password) {
-      return interaction.reply({ content: '❌ **Incorrect password!** Access denied.', ephemeral: true });
-    }
-
-    await targetVc.permissionOverwrites.edit(interaction.user.id, {
-      ViewChannel: true,
-      Connect: true
-    });
-
-    // If the user is currently connected to another voice channel, move them in automatically!
-    if (interaction.member?.voice?.channelId && interaction.member.voice.channelId !== targetVc.id) {
-      await interaction.member.voice.setChannel(targetVc).catch(() => {});
-    }
-
-    return interaction.reply({
-      content: `✅ **Password accepted!** You now have access to join <#${targetVc.id}>.`,
       ephemeral: true
     });
   }
@@ -688,11 +878,13 @@ client.on('interactionCreate', async interaction => {
     // Move or create OpenCodeX text channel (owner‑only) at the top
     const openChannel = await ensureOpenCodeXChannel(guild, category.id);
 
-    // Create or move bot‑logs channel beneath it
-    let logChannel = guild.channels.cache.find(c => c.type === ChannelType.GuildText && c.name === TEMP_TEXT_CHANNEL_NAME);
+    // Create or move Session-logs channel beneath it
+    let logChannel = guild.channels.cache.find(
+      c => c.type === ChannelType.GuildText && (c.name === TEMP_TEXT_CHANNEL_NAME || c.name === LEGACY_LOG_CHANNEL_NAME)
+    );
     if (!logChannel) {
       logChannel = await guild.channels.create({
-        name: TEMP_TEXT_CHANNEL_NAME,
+        name: 'Session-logs',
         type: ChannelType.GuildText,
         parent: category.id,
         permissionOverwrites: [
@@ -700,8 +892,13 @@ client.on('interactionCreate', async interaction => {
           { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks, PermissionFlagsBits.AttachFiles] }
         ]
       });
-    } else if (logChannel.parentId !== category.id) {
-      await logChannel.setParent(category.id, { lockPermissions: false });
+    } else {
+      if (logChannel.name === LEGACY_LOG_CHANNEL_NAME) {
+        await logChannel.setName('Session-logs').catch(() => {});
+      }
+      if (logChannel.parentId !== category.id) {
+        await logChannel.setParent(category.id, { lockPermissions: false });
+      }
     }
 
     // Ensure OpenCodeX is above bot-logs (position 0, bot-logs position 1)
@@ -998,6 +1195,31 @@ client.on('interactionCreate', async interaction => {
       return interaction.reply({ content: `✅ Auto-role set! New members joining the server will automatically receive <@&${role.id}>.`, ephemeral: true });
     }
 
+    // Owner‑only /cleanvirus – wipe compromised user's recent messages across ALL channels
+    if (interaction.commandName === 'cleanvirus') {
+      if (interaction.user.id !== interaction.guild.ownerId) {
+        return interaction.reply({ content: '❌ Only the server owner can run `/cleanvirus`.', ephemeral: true });
+      }
+      const targetUser = interaction.options.getUser('user');
+      const punishment = interaction.options.getString('action') || 'timeout';
+      await interaction.deferReply();
+      const { totalDeleted, channelsCleaned, actionResult } = await wipeUserMessagesAcrossGuild(
+        interaction.guild,
+        targetUser.id,
+        punishment
+      );
+      const embed = new EmbedBuilder()
+        .setTitle('🛡️ Anti-Virus / Cross-Channel Spam Cleanup Complete')
+        .setDescription(
+          `**Target User:** <@${targetUser.id}> (\`${targetUser.tag}\`)\n` +
+          `**Messages Deleted:** \`${totalDeleted}\` across \`${channelsCleaned}\` channel(s)\n` +
+          `**Action Taken:** ${actionResult}`
+        )
+        .setColor(0xe74c3c)
+        .setTimestamp();
+      return interaction.editReply({ embeds: [embed] });
+    }
+
     const targetVc = getTargetVc();
     if (!targetVc) {
       return interaction.reply({ content: '❌ Join your temporary voice channel first before using this command.', ephemeral: true });
@@ -1028,7 +1250,7 @@ client.on('interactionCreate', async interaction => {
     switch (interaction.commandName) {
       case 'lock': {
         const everyoneOverwrite = targetVc.permissionOverwrites.cache.get(interaction.guildId);
-        const currentlyLocked = everyoneOverwrite?.deny.has(PermissionFlagsBits.Connect);
+        const currentlyLocked = Boolean(vcData?.password) || Boolean(everyoneOverwrite?.deny.has(PermissionFlagsBits.Connect));
         if (currentlyLocked) {
           await targetVc.permissionOverwrites.edit(interaction.guildId, {
             Connect: null
@@ -1038,7 +1260,7 @@ client.on('interactionCreate', async interaction => {
           const updatedEmbed = createControlEmbed(vcData?.ownerId || interaction.user.id, ownerMember?.displayName || 'Owner', false, false);
           if (vcData?.panelMessageId) {
             const panelMsg = await targetVc.messages.fetch(vcData.panelMessageId).catch(() => null);
-            if (panelMsg) await panelMsg.edit({ embeds: [updatedEmbed], components: createControlRows(false) }).catch(() => {});
+            if (panelMsg) await panelMsg.edit({ embeds: [updatedEmbed], components: createControlRows(false, false) }).catch(() => {});
           }
           return interaction.reply({ content: `🔓 <#${targetVc.id}> unlocked (password cleared).`, ephemeral: true });
         }
@@ -1150,11 +1372,17 @@ client.on('interactionCreate', async interaction => {
 
   // Button handling
   if (interaction.isButton()) {
-    // Anyone can click "🔑 Enter Password" on a password-locked VC
-    if (interaction.customId === 'enter_password') {
-      const targetVc = interaction.channel?.isVoiceBased?.() ? interaction.channel : getTargetVc();
+    // Anyone can click "🔑 Enter Password" on a password-locked VC (in VC chat, Waiting Room, or DM)
+    if (interaction.customId === 'enter_password' || interaction.customId.startsWith('enter_password:')) {
+      const explicitVcId = interaction.customId.includes(':') ? interaction.customId.split(':')[1] : null;
+      let targetVc = null;
+      if (explicitVcId) {
+        targetVc = client.channels.cache.get(explicitVcId) || await client.channels.fetch(explicitVcId).catch(() => null);
+      } else {
+        targetVc = interaction.channel?.isVoiceBased?.() ? interaction.channel : getTargetVc();
+      }
       if (!targetVc) {
-        return interaction.reply({ content: '❌ Open the voice channel chat to click this button.', ephemeral: true });
+        return interaction.reply({ content: '❌ Voice channel no longer exists.', ephemeral: true });
       }
       const vcData = activeVcs.get(targetVc.id);
       if (!vcData || !vcData.password) {
@@ -1162,7 +1390,7 @@ client.on('interactionCreate', async interaction => {
       }
       const modal = new ModalBuilder()
         .setCustomId(`modal_enter_password:${targetVc.id}`)
-        .setTitle(`Enter Password for ${targetVc.name}`)
+        .setTitle(`Enter Password for ${targetVc.name.slice(0, 25)}`)
         .addComponents(
           new ActionRowBuilder().addComponents(
             new TextInputBuilder()
@@ -1218,6 +1446,10 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ content: '❌ Only the VC owner or server owner can accept/deny join requests.', ephemeral: true });
       }
       if (actionType === 'knock_accept') {
+        if (vcData) {
+          if (!vcData.allowedUsers) vcData.allowedUsers = new Set();
+          vcData.allowedUsers.add(requesterId);
+        }
         await targetVc.permissionOverwrites.edit(requesterId, {
           ViewChannel: true,
           Connect: true
@@ -1272,7 +1504,7 @@ client.on('interactionCreate', async interaction => {
       case 'vc_lock':
       case 'lock': {
         const everyoneOverwrite = targetVc.permissionOverwrites.cache.get(interaction.guildId);
-        const currentlyLocked = everyoneOverwrite?.deny.has(PermissionFlagsBits.Connect);
+        const currentlyLocked = Boolean(vcData?.password) || Boolean(everyoneOverwrite?.deny.has(PermissionFlagsBits.Connect));
         if (currentlyLocked) {
           await targetVc.permissionOverwrites.edit(interaction.guildId, {
             Connect: null
@@ -1496,8 +1728,13 @@ client.on('interactionCreate', async interaction => {
       return interaction.reply({ content: '❌ Voice channel not found.', ephemeral: true });
     }
     await interaction.deferReply({ ephemeral: true });
+    const vcData = activeVcs.get(targetVc.id);
     const selectedUserIds = interaction.values;
     for (const userId of selectedUserIds) {
+      if (vcData) {
+        if (!vcData.allowedUsers) vcData.allowedUsers = new Set();
+        vcData.allowedUsers.add(userId);
+      }
       await targetVc.permissionOverwrites.edit(userId, {
         ViewChannel: true,
         Connect: true
@@ -1597,17 +1834,96 @@ client.on('channelDelete', async channel => {
 });
 
 // -------------------------------------------------
-// Message handler in #OpenCodeX:
-//   say <#channel or channel-name> <message>
-//   say <message>  (uses /channelmsg default channel)
+// Message handler:
+// 1. Automatic Cross-Channel Virus/Flood Detector
+// 2. #OpenCodeX Owner Commands:
+//    - cleanvirus <@user or userId> [timeout|kick|ban|none]
+//    - say <#channel or channel-name> <message>
+//    - say <message> (uses /channelmsg default channel)
 // -------------------------------------------------
 client.on('messageCreate', async message => {
   try {
     if (!message.inGuild() || message.author.bot) return;
+
+    // 1. Auto-detect virus cross-channel flooding (same message posted in 3+ channels within 15 seconds)
+    if (message.author.id !== message.guild.ownerId && message.content.trim().length > 4) {
+      const normalized = message.content.trim().toLowerCase();
+      const now = Date.now();
+      const trackerKey = `${message.guild.id}:${message.author.id}`;
+      const prev = spamTracker.get(trackerKey);
+
+      if (prev && prev.text === normalized && now - prev.firstTs < 15000) {
+        prev.channels.add(message.channel.id);
+        if (prev.channels.size >= 3 && !prev.triggered) {
+          prev.triggered = true;
+          logger.warn(`🚨 Auto-detected cross-channel virus flood from ${message.author.tag} in ${message.guild.name}`);
+          const { totalDeleted, channelsCleaned, actionResult } = await wipeUserMessagesAcrossGuild(
+            message.guild,
+            message.author.id,
+            'timeout'
+          );
+          const openChannel = message.guild.channels.cache.find(
+            c => c.type === ChannelType.GuildText && c.name.toLowerCase() === OPEN_CODEX_CHANNEL_NAME
+          );
+          const alertEmbed = new EmbedBuilder()
+            .setTitle('🚨 Auto Anti-Virus Flood Protection Triggered!')
+            .setDescription(
+              `**User:** <@${message.author.id}> (\`${message.author.tag}\`) flooded the same message across **${prev.channels.size}+ channels**.\n` +
+              `**Cleaned:** Deleted \`${totalDeleted}\` message(s) across \`${channelsCleaned}\` channel(s).\n` +
+              `**Action:** ${actionResult}`
+            )
+            .setColor(0xe74c3c)
+            .setTimestamp();
+          if (openChannel) await openChannel.send({ content: `<@${message.guild.ownerId}>`, embeds: [alertEmbed] }).catch(() => {});
+          return;
+        }
+      } else {
+        spamTracker.set(trackerKey, {
+          text: normalized,
+          channels: new Set([message.channel.id]),
+          firstTs: now,
+          triggered: false
+        });
+      }
+    }
+
+    // 2. Owner commands inside #OpenCodeX
     if (message.author.id !== message.guild.ownerId) return;
     if (message.channel.name.toLowerCase() !== OPEN_CODEX_CHANNEL_NAME) return;
 
     const raw = message.content.trim();
+
+    // Command: cleanvirus <@user or userId> [timeout|kick|ban|none]
+    if (/^(cleanvirus|virusclean|nukespam)\s+/i.test(raw)) {
+      const args = raw.replace(/^(cleanvirus|virusclean|nukespam)\s+/i, '').trim().split(/\s+/);
+      const userToken = args[0] || '';
+      const actionArg = (args[1] || 'timeout').toLowerCase();
+      const userIdMatch = userToken.match(/^<@!?(\d+)>$/) || userToken.match(/^(\d{17,20})$/);
+      if (!userIdMatch) {
+        await message.reply('❌ Usage: `cleanvirus @user [timeout|kick|ban|none]` o kaya `/cleanvirus`');
+        return;
+      }
+      const targetUserId = userIdMatch[1];
+      const validAction = ['timeout', 'kick', 'ban', 'none'].includes(actionArg) ? actionArg : 'timeout';
+      const statusMsg = await message.reply(`🧹 Scanning all channels and wiping spam messages from <@${targetUserId}>...`);
+      const { totalDeleted, channelsCleaned, actionResult } = await wipeUserMessagesAcrossGuild(
+        message.guild,
+        targetUserId,
+        validAction
+      );
+      const embed = new EmbedBuilder()
+        .setTitle('🛡️ Anti-Virus / Cross-Channel Spam Cleanup Complete')
+        .setDescription(
+          `**Target User:** <@${targetUserId}>\n` +
+          `**Messages Deleted:** \`${totalDeleted}\` across \`${channelsCleaned}\` channel(s)\n` +
+          `**Action Taken:** ${actionResult}`
+        )
+        .setColor(0xe74c3c)
+        .setTimestamp();
+      await statusMsg.edit({ content: null, embeds: [embed] }).catch(() => {});
+      return;
+    }
+
     if (!/^say\s+/i.test(raw)) return;
 
     const restText = raw.replace(/^say\s+/i, '').trim();

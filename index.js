@@ -44,7 +44,6 @@ const OPEN_CODEX_CHANNEL_NAME = 'opencodex';
 const TEMP_VC_NAME = 'Join to Create VCs';
 const TEMP_TEXT_CHANNEL_NAME = 'session-logs';
 const LEGACY_LOG_CHANNEL_NAME = 'bot-logs';
-const WAITING_ROOM_VC_NAME = '🔐 Waiting Room (Enter Password)';
 const DEFAULT_CATEGORY_NAME = "Summoner’s Hall";
 const GUILD_COMMANDS = true; // set false for global registration (may take 1h)
 
@@ -77,9 +76,8 @@ function createControlRows(hasPassword = false, isLocked = false) {
     new ButtonBuilder().setCustomId('transfer').setLabel('Transfer').setStyle(ButtonStyle.Secondary).setEmoji('👑'),
     new ButtonBuilder().setCustomId('mute_all').setLabel('Mute All').setStyle(ButtonStyle.Secondary).setEmoji('🔇')
   );
-  const row3Components = [
-    new ButtonBuilder().setCustomId('claim_vc').setLabel('Claim VC').setStyle(ButtonStyle.Success).setEmoji('🙋‍♂️')
-  ];
+  const rows = [row1, row2];
+  const row3Components = [];
   if (isLocked) {
     row3Components.push(
       new ButtonBuilder().setCustomId('knock_vc').setLabel('Request to Join').setStyle(ButtonStyle.Secondary).setEmoji('🔔')
@@ -90,8 +88,10 @@ function createControlRows(hasPassword = false, isLocked = false) {
       new ButtonBuilder().setCustomId('enter_password').setLabel('Enter Password').setStyle(ButtonStyle.Primary).setEmoji('🔑')
     );
   }
-  const row3 = new ActionRowBuilder().addComponents(...row3Components);
-  return [row1, row2, row3];
+  if (row3Components.length > 0) {
+    rows.push(new ActionRowBuilder().addComponents(...row3Components));
+  }
+  return rows;
 }
 
 function createControlEmbed(ownerId, displayName, isLocked = false, hasPassword = false, isHidden = false) {
@@ -110,7 +110,7 @@ function createControlEmbed(ownerId, displayName, isLocked = false, hasPassword 
       '- **Set Limit** (0 = unlimited) & **Rename** VC\n' +
       '- **Hide/Show** (Ghost Mode) & **Mute All** (Party Mode)\n' +
       '- **Invite / Kick / Ban / Transfer**\n' +
-      '- **Claim VC** (if owner left) & **Request to Join / Enter Password**'
+      '- **Request to Join / Enter Password** (when locked)'
     )
     .setColor(0x5865f2);
 }
@@ -164,7 +164,6 @@ const commands = [
   },
   { name: 'rename', description: 'Rename your temporary VC', options: [{ name: 'name', type: 3, description: 'New VC name', required: true }] },
   { name: 'hide', description: 'Toggle Ghost Mode (hide/show VC from channel list)' },
-  { name: 'claim', description: 'Claim ownership of the current temporary VC if the owner left' },
   { name: 'muteall', description: 'Server-mute or unmute everyone inside this VC' },
   {
     name: 'embed',
@@ -505,6 +504,14 @@ client.once('ready', async () => {
         if (!genVc) {
           await guild.channels.create({ name: TEMP_VC_NAME, type: ChannelType.GuildVoice, parent: category.id });
         }
+
+        // Clean up any leftover Waiting Room VC if one exists
+        const oldWaitingVc = guild.channels.cache.find(
+          c => c.type === ChannelType.GuildVoice && c.name.includes('Waiting Room')
+        );
+        if (oldWaitingVc) {
+          await oldWaitingVc.delete().catch(() => {});
+        }
       }
     } catch (err) {
       logger.error(`Setup error in guild ${guild.name}: ${err}`);
@@ -591,32 +598,12 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     // Check if this VC has a password and the joining user is not authorized yet
     const isAuthorized =
       member.id === data.ownerId ||
-      member.id === guild.ownerId ||
       data.allowedUsers?.has(member.id) ||
       newState.channel.permissionOverwrites.cache.get(member.id)?.allow.has(PermissionFlagsBits.Connect);
 
     if (data.password && !isAuthorized && !member.user.bot) {
-      // Create or find a Waiting Room VC to hold the user while they enter the password
-      let waitingVc = guild.channels.cache.find(
-        c => c.type === ChannelType.GuildVoice && c.name === WAITING_ROOM_VC_NAME && c.parentId === newState.channel.parentId
-      );
-      if (!waitingVc) {
-        waitingVc = await guild.channels.create({
-          name: WAITING_ROOM_VC_NAME,
-          type: ChannelType.GuildVoice,
-          parent: newState.channel.parentId,
-          permissionOverwrites: [
-            { id: guild.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect], deny: [PermissionFlagsBits.Speak] },
-            { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.SendMessages, PermissionFlagsBits.MoveMembers] }
-          ]
-        }).catch(() => null);
-      }
-
-      if (waitingVc) {
-        await member.voice.setChannel(waitingVc).catch(() => {});
-      } else {
-        await member.voice.disconnect().catch(() => {});
-      }
+      // Immediately disconnect the user from voice so they cannot enter without entering the password first
+      await member.voice.disconnect().catch(() => {});
 
       const passRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
@@ -629,14 +616,11 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
       const promptEmbed = new EmbedBuilder()
         .setTitle(`🔐 Password Required — ${newState.channel.name}`)
         .setDescription(
-          `Hey <@${member.id}>! **${newState.channel.name}** is protected with a password.\n\n` +
-          `Click the **🔑 Enter Password** button below and type the password to get pulled into the voice channel automatically!`
+          `Hey <@${member.id}>! **${newState.channel.name}** is locked with a password.\n\n` +
+          `Click the **🔑 Enter Password** button below, enter the password, and you will be able to join <#${newState.channelId}>!`
         )
         .setColor(0xf1c40f);
 
-      if (waitingVc) {
-        await waitingVc.send({ content: `<@${member.id}>`, embeds: [promptEmbed], components: [passRow] }).catch(() => {});
-      }
       await newState.channel.send({ content: `<@${member.id}>`, embeds: [promptEmbed], components: [passRow] }).catch(() => {});
       await member.send({ embeds: [promptEmbed], components: [passRow] }).catch(() => {});
       return;
@@ -728,11 +712,6 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
       if (logChannel) await logChannel.send({ embeds: [logEmbed] }).catch(() => {});
       await leftChannel.delete().catch(() => {});
     }
-
-    // Also auto-delete the Waiting Room VC when it becomes empty
-    if (leftChannel.name === WAITING_ROOM_VC_NAME && leftChannel.members.size === 0) {
-      await leftChannel.delete().catch(() => {});
-    }
   }
 });
 
@@ -801,7 +780,7 @@ client.on('interactionCreate', async interaction => {
       Connect: true
     }).catch(() => {});
 
-    // Fetch member in that guild and move them from Waiting Room (or any VC) into targetVc automatically!
+    // Fetch member in that guild and move them into targetVc if they are currently in another VC
     const guildMember = interaction.member?.voice
       ? interaction.member
       : await targetVc.guild.members.fetch(interaction.user.id).catch(() => null);
@@ -810,7 +789,7 @@ client.on('interactionCreate', async interaction => {
     }
 
     return interaction.reply({
-      content: `✅ **Password accepted!** You have been moved into <#${targetVc.id}>.`,
+      content: `✅ **Password accepted!** You now have access to join <#${targetVc.id}>!`,
       ephemeral: true
     });
   }
@@ -1325,19 +1304,6 @@ client.on('interactionCreate', async interaction => {
     }
 
     const vcData = activeVcs.get(targetVc.id);
-
-    // /claim can be used by any member inside the VC if the current owner is no longer in the VC
-    if (interaction.commandName === 'claim') {
-      const currentOwnerId = vcData?.ownerId;
-      if (currentOwnerId && targetVc.members.has(currentOwnerId) && interaction.user.id !== interaction.guild.ownerId) {
-        return interaction.reply({ content: `❌ The current VC owner (<@${currentOwnerId}>) is still inside this channel!`, ephemeral: true });
-      }
-      if (currentOwnerId) await targetVc.permissionOverwrites.delete(currentOwnerId).catch(() => {});
-      await targetVc.permissionOverwrites.edit(interaction.user.id, { ViewChannel: true, Connect: true, ManageChannels: true });
-      await targetVc.setName(`${interaction.member.displayName}'s VC`).catch(() => {});
-      if (vcData) vcData.ownerId = interaction.user.id;
-      return interaction.reply({ content: `🙋‍♂️ <@${interaction.user.id}> claimed ownership of <#${targetVc.id}>!` });
-    }
     const isServerOwner = interaction.user.id === interaction.guild.ownerId;
     const isOwner = isServerOwner || (vcData
       ? interaction.user.id === vcData.ownerId
@@ -1567,24 +1533,6 @@ client.on('interactionCreate', async interaction => {
           components: []
         });
       }
-    }
-
-    // Anyone inside the VC can click "🙋‍♂️ Claim VC" if the owner left
-    if (interaction.customId === 'claim_vc') {
-      const targetVc = getTargetVc();
-      if (!targetVc) {
-        return interaction.reply({ content: '❌ Join the voice channel first to claim it.', ephemeral: true });
-      }
-      const vcData = activeVcs.get(targetVc.id);
-      const currentOwnerId = vcData?.ownerId;
-      if (currentOwnerId && targetVc.members.has(currentOwnerId) && interaction.user.id !== interaction.guild.ownerId) {
-        return interaction.reply({ content: `❌ The current VC owner (<@${currentOwnerId}>) is still inside this channel!`, ephemeral: true });
-      }
-      if (currentOwnerId) await targetVc.permissionOverwrites.delete(currentOwnerId).catch(() => {});
-      await targetVc.permissionOverwrites.edit(interaction.user.id, { ViewChannel: true, Connect: true, ManageChannels: true });
-      await targetVc.setName(`${interaction.member.displayName}'s VC`).catch(() => {});
-      if (vcData) vcData.ownerId = interaction.user.id;
-      return interaction.reply({ content: `🙋‍♂️ <@${interaction.user.id}> claimed ownership of <#${targetVc.id}>!` });
     }
 
     const targetVc = getTargetVc();

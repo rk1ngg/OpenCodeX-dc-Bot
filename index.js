@@ -26,7 +26,7 @@ import {
   time
 } from 'discord.js';
 import readline from 'readline';
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import logger from './src/logger.js';
 import { getConfig, setConfig } from './src/configStore.js';
@@ -1185,7 +1185,7 @@ client.on('interactionCreate', async interaction => {
       return interaction.editReply({ content: `🧹 Successfully deleted **${deleted.size}** message(s) in <#${interaction.channel.id}>!` });
     }
 
-    // Owner‑only /updatebot (1-click git pull & restart)
+    // Owner‑only /updatebot (1-click git pull & in-container restart)
     if (interaction.commandName === 'updatebot') {
       if (interaction.user.id !== interaction.guild.ownerId) {
         return interaction.reply({ content: '❌ Only the server owner can run `/updatebot`.', ephemeral: true });
@@ -1195,9 +1195,9 @@ client.on('interactionCreate', async interaction => {
         const { stdout, stderr } = await execAsync('git pull origin main');
         const output = (stdout || stderr || 'Already up to date.').slice(0, 1800);
         await interaction.editReply({
-          content: `🔄 **Git Pull Complete:**\n\`\`\`\n${output}\n\`\`\`\n♻️ Restarting bot process now...`
+          content: `🔄 **Git Pull Complete:**\n\`\`\`\n${output}\n\`\`\`\n♻️ Restarting bot now (check **#OpenCodeX** for the online status)...`
         });
-        setTimeout(() => process.exit(0), 1500);
+        setTimeout(() => restartBotProcess(), 1000);
         return;
       } catch (err) {
         return interaction.editReply({
@@ -2123,8 +2123,57 @@ rl.on('line', async line => {
 });
 
 // -------------------------------------------------
-// Graceful shutdown – notify #opencodex & delete any orphaned temp VCs
+// Graceful shutdown & In-Container Hot Restart (/updatebot)
 // -------------------------------------------------
+async function restartBotProcess() {
+  logger.info('♻️ Restarting bot process in-place after update...');
+  try {
+    rl.close();
+    process.stdin.pause();
+  } catch (_) {}
+  try {
+    await client.destroy();
+  } catch (_) {}
+
+  // If already running as a spawned child worker, exit with code 75 so parent supervisor respawns us
+  if (process.env.IS_RESTARTED_CHILD === '1') {
+    process.exit(75);
+    return;
+  }
+
+  // Otherwise, this is PID 1 (main container process on bot-hosting.net):
+  // Keep PID 1 alive so the Docker container never stops, and supervise the new child process!
+  process.removeAllListeners('SIGINT');
+  process.removeAllListeners('SIGTERM');
+
+  const spawnWorker = () => {
+    logger.info('🚀 Spawning updated bot instance...');
+    const child = spawn(process.execPath, process.argv.slice(1), {
+      stdio: 'inherit',
+      env: { ...process.env, IS_RESTARTED_CHILD: '1' }
+    });
+
+    const forwardSignal = sig => {
+      if (!child.killed) child.kill(sig);
+    };
+    process.on('SIGINT', forwardSignal);
+    process.on('SIGTERM', forwardSignal);
+
+    child.on('exit', code => {
+      process.off('SIGINT', forwardSignal);
+      process.off('SIGTERM', forwardSignal);
+      if (code === 75) {
+        logger.info('♻️ Update requested by child process, respawning...');
+        setTimeout(spawnWorker, 500);
+      } else {
+        process.exit(code ?? 0);
+      }
+    });
+  };
+
+  spawnWorker();
+}
+
 async function handleShutdown(signal) {
   logger.info(`🛑 Received ${signal}, shutting down and cleaning up temp VCs...`);
   for (const guild of client.guilds.cache.values()) {

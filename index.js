@@ -387,11 +387,25 @@ client.once('ready', async () => {
   logger.info(`✅ Bot logged in as ${client.user.tag}`);
 
   for (const guild of client.guilds.cache.values()) {
-    await registerGuildCommands(guild);
     try {
       const openChannel = await ensureOpenCodeXChannel(guild);
-
       const cfg = await getConfig(guild.id);
+
+      // Immediately notify #opencodex that the bot is online (before slash command registration)
+      if (openChannel) {
+        const onlineEmbed = new EmbedBuilder()
+          .setTitle('🟢 Bot Connected & Online!')
+          .setDescription(
+            `**${client.user.tag}** is now online and ready.\n` +
+            `• **Default \`/channelmsg\` Target:** ${cfg.consoleChannelId ? `<#${cfg.consoleChannelId}>` : '*Not set*'}`
+          )
+          .setColor(0x2ecc71);
+        openChannel.send({ embeds: [onlineEmbed] }).catch(() => {});
+      }
+
+      // Register slash commands in background without blocking startup
+      registerGuildCommands(guild).catch(err => logger.error(`Command reg error: ${err}`));
+
       if (cfg.setupCategoryName) {
         let category = guild.channels.cache.find(
           c => c.type === ChannelType.GuildCategory && c.name === cfg.setupCategoryName
@@ -428,20 +442,6 @@ client.once('ready', async () => {
           await guild.channels.create({ name: TEMP_VC_NAME, type: ChannelType.GuildVoice, parent: category.id });
         }
       }
-
-      // Send "Bot Connected / Restarted" notification to #opencodex
-      if (openChannel) {
-        const onlineEmbed = new EmbedBuilder()
-          .setTitle('🟢 Bot Connected & Online!')
-          .setDescription(
-            `**${client.user.tag}** is now online and ready.\n` +
-            `• **Status:** Connected (${time(new Date(), 'R')})\n` +
-            `• **Default \`/channelmsg\` Target:** ${cfg.consoleChannelId ? `<#${cfg.consoleChannelId}>` : '*Not set*'}`
-          )
-          .setColor(0x2ecc71)
-          .setTimestamp();
-        await openChannel.send({ embeds: [onlineEmbed] }).catch(() => {});
-      }
     } catch (err) {
       logger.error(`Setup error in guild ${guild.name}: ${err}`);
     }
@@ -460,10 +460,9 @@ client.on('shardReady', async () => {
     if (openChannel) {
       const reconEmbed = new EmbedBuilder()
         .setTitle('🟢 Bot Reconnected!')
-        .setDescription(`**${client.user.tag}** re-established connection to Discord (${time(new Date(), 'R')}).`)
-        .setColor(0x2ecc71)
-        .setTimestamp();
-      await openChannel.send({ embeds: [reconEmbed] }).catch(() => {});
+        .setDescription(`**${client.user.tag}** re-established connection to Discord.`)
+        .setColor(0x2ecc71);
+      openChannel.send({ embeds: [reconEmbed] }).catch(() => {});
     }
   }
 });
@@ -2092,9 +2091,8 @@ async function handleShutdown(signal) {
     if (openChannel) {
       const offEmbed = new EmbedBuilder()
         .setTitle('🔴 Bot Disconnecting / Restarting...')
-        .setDescription(`**${client.user?.tag || 'Bot'}** is shutting down or restarting (${time(new Date(), 'R')}).`)
-        .setColor(0xe74c3c)
-        .setTimestamp();
+        .setDescription(`**${client.user?.tag || 'Bot'}** is shutting down or restarting.`)
+        .setColor(0xe74c3c);
       await openChannel.send({ embeds: [offEmbed] }).catch(() => {});
     }
   }
